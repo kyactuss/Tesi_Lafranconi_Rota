@@ -10,13 +10,13 @@ from datetime import datetime
 
 # Configurazione valori default
 DEFAULT_CONFIG = {
-    'map_size': 10,
-    'real_alpha': 0.00,
-    'real_beta': 0.00,
-    'max_iterations': 2000000,
-    'max_time': 4,
+    'map_size': 15,
+    'real_alpha': 0.01,
+    'real_beta': 0.01,
+    'max_iterations': 1000000,
+    'max_time': 3.5,
     'depth_limit': 100,
-    'discount_factor': 0.995,
+    'discount_factor': 0.9,
     'exploration_const': math.sqrt(2),
     'reward_alpha': 3,
 }
@@ -612,15 +612,14 @@ def draw_static_background(surface, p_map, font_cell, params):
             surface.blit(text, (c * CELL_SIZE + 5, r * CELL_SIZE + 5))
 
 # Funzioni per disegnare elementi dinamici: droni, target e barra laterale
-def draw_elements(screen, belief_map, drones, params, font_sidebar, GRID_WIDTH, CELL_SIZE, steps_taken, pomcp_stats):
-    
-    SIDEBAR_WIDTH = 400
+def draw_elements(screen, belief_map, drones, params, font_sidebar, GRID_WIDTH, CELL_SIZE, steps_taken, pomcp_stats, SIDEBAR_WIDTH):
     BLACK = (0, 0, 0)
     RED = (255, 0, 0)
     GREEN = (0, 200, 0)
     GRAY = (200, 200, 200)
     WHITE = (255, 255, 255)
     BLUE = (0, 0, 255)
+    PURPLE = (100, 0, 100)
 
     # Target (X) - posizione logica (riga, colonna) -> (x, y) Pygame
     tx, ty = params['target_pos']
@@ -635,82 +634,126 @@ def draw_elements(screen, belief_map, drones, params, font_sidebar, GRID_WIDTH, 
 
     d2_pos = drones[1]
     d2_center = (d2_pos[1] * CELL_SIZE + CELL_SIZE // 2, d2_pos[0] * CELL_SIZE + CELL_SIZE // 2)
-    pygame.draw.circle(screen, GREEN, d2_center, CELL_SIZE // 3, 4)
+    pygame.draw.circle(screen, GREEN, d2_center, CELL_SIZE // 3 - 4, 4)
 
-    # Sidebar
-    sidebar_rect = pygame.Rect(GRID_WIDTH, 0, SIDEBAR_WIDTH, GRID_WIDTH)
+    # Sidebar - estesa per tutta l'altezza della finestra
+    screen_height = screen.get_height()
+    sidebar_rect = pygame.Rect(GRID_WIDTH, 0, SIDEBAR_WIDTH, screen_height)
     pygame.draw.rect(screen, GRAY, sidebar_rect)
 
-    # Statistiche POMCP
-    y_offset = 30
-    spacing = 40
+    # Statistiche
+    y_offset = 20
+    spacing = 22
 
-    text_moves = font_sidebar.render(f"Mosse Totali: {steps_taken}", True, BLACK)
-    screen.blit(text_moves, (GRID_WIDTH + 20, y_offset))
+    text_step = font_sidebar.render(f"Step: {steps_taken}", True, BLACK)
+    screen.blit(text_step, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing + 8
+
+    # Sezione POMCP Centralizzato
+    text_pomcp_header = font_sidebar.render("=== POMCP Centralizzato ===", True, BLUE)
+    screen.blit(text_pomcp_header, (GRID_WIDTH + 10, y_offset))
     y_offset += spacing
 
-    text_sims = font_sidebar.render(f"Simulazioni MCTS: {pomcp_stats['simulations']}", True, BLACK)
-    screen.blit(text_sims, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_nodes = font_sidebar.render(f"Nodi Creati: {pomcp_stats['nodes']}", True, BLACK)
-    screen.blit(text_nodes, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_time = font_sidebar.render(f"Tempo MCTS: {pomcp_stats['time']:.3f}s", True, BLACK)
-    screen.blit(text_time, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_depth = font_sidebar.render(f"Profondità max: {pomcp_stats.get('depth', 0)}", True, BLACK)
+    text_depth = font_sidebar.render(f"Tree Depth: {pomcp_stats.get('depth', 0)}", True, BLACK)
     screen.blit(text_depth, (GRID_WIDTH + 20, y_offset))
     y_offset += spacing
 
-    text_actions = font_sidebar.render("Top azioni (Q/N):", True, BLACK)
-    screen.blit(text_actions, (GRID_WIDTH + 20, y_offset))
-    y_offset += 30
+    text_sims = font_sidebar.render(f"Simulations: {pomcp_stats['simulations']}", True, BLACK)
+    screen.blit(text_sims, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing
 
-    for idx, entry in enumerate(pomcp_stats.get('top_actions', []), start=1):
-        action_label = f"{idx}. {entry['action']}"
-        text_action = font_sidebar.render(action_label, True, BLACK)
-        screen.blit(text_action, (GRID_WIDTH + 20, y_offset))
-        y_offset += 24
+    text_nodes = font_sidebar.render(f"Nodes Created: {pomcp_stats['nodes']}", True, BLACK)
+    screen.blit(text_nodes, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing
 
-        detail_label = f"   Q={entry['q']:.3f}, N={entry['n']}"
-        text_detail = font_sidebar.render(detail_label, True, BLACK)
-        screen.blit(text_detail, (GRID_WIDTH + 40, y_offset))
-        y_offset += 30
+    text_time = font_sidebar.render(f"POMCP Time: {pomcp_stats['time']:.3f}s", True, BLACK)
+    screen.blit(text_time, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing + 8
 
-    y_offset += 10
+    # Azione migliore combinata
+    text_best_header = font_sidebar.render("Best Joint Action:", True, BLACK)
+    screen.blit(text_best_header, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing
 
-    # Max probabilità
+    best_action = pomcp_stats.get('best_action', ('Stay', 'Stay'))
+    best_q = pomcp_stats.get('best_q', 0.0)
+    
+    text_d1_action = font_sidebar.render(f"  Drone 1: {best_action[0]}", True, RED)
+    screen.blit(text_d1_action, (GRID_WIDTH + 30, y_offset))
+    y_offset += spacing
+
+    text_d2_action = font_sidebar.render(f"  Drone 2: {best_action[1]}", True, GREEN)
+    screen.blit(text_d2_action, (GRID_WIDTH + 30, y_offset))
+    y_offset += spacing
+
+    text_q_value = font_sidebar.render(f"  Q-value: {best_q:.4f}", True, BLACK)
+    screen.blit(text_q_value, (GRID_WIDTH + 30, y_offset))
+    y_offset += spacing + 8
+
+    # Posizioni droni
+    text_pos_header = font_sidebar.render("Drone Positions:", True, BLACK)
+    screen.blit(text_pos_header, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing
+
+    text_d1_pos = font_sidebar.render(f"  D1: {d1_pos}", True, RED)
+    screen.blit(text_d1_pos, (GRID_WIDTH + 30, y_offset))
+    y_offset += spacing
+
+    text_d2_pos = font_sidebar.render(f"  D2: {d2_pos}", True, GREEN)
+    screen.blit(text_d2_pos, (GRID_WIDTH + 30, y_offset))
+    y_offset += spacing + 10
+
+    # Max probabilità e cella
     max_prob = belief_map.max()
     max_pos = np.unravel_index(np.argmax(belief_map), belief_map.shape)
     text_max = font_sidebar.render(f"Max Prob: {max_prob:.4f}", True, BLACK)
     screen.blit(text_max, (GRID_WIDTH + 20, y_offset))
-    y_offset += 30
-    text_pos = font_sidebar.render(f"  @ {max_pos}", True, BLACK)
-    screen.blit(text_pos, (GRID_WIDTH + 40, y_offset))
-    y_offset += spacing + 20
+    y_offset += spacing
+    text_max_cell = font_sidebar.render(f"Max Cell: {max_pos}", True, BLACK)
+    screen.blit(text_max_cell, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing + 10
 
-    # Barra probabilità massima
-    pygame.draw.rect(screen, WHITE, (GRID_WIDTH + 20, y_offset, SIDEBAR_WIDTH - 40, 30))
-    pygame.draw.rect(screen, BLUE, (GRID_WIDTH + 20, y_offset, (SIDEBAR_WIDTH - 40) * min(max_prob, 1.0), 30))
-    thr_pos = (GRID_WIDTH + 20) + (SIDEBAR_WIDTH - 40) * 0.95
-    pygame.draw.line(screen, GREEN, (thr_pos, y_offset - 5), (thr_pos, y_offset + 35), 3)
+    # Barra probabilità massima con threshold
+    bar_width = SIDEBAR_WIDTH - 40
+    pygame.draw.rect(screen, WHITE, (GRID_WIDTH + 20, y_offset, bar_width, 20))
+    pygame.draw.rect(screen, BLUE, (GRID_WIDTH + 20, y_offset, bar_width * min(max_prob, 1.0), 20))
+    thr_pos = (GRID_WIDTH + 20) + bar_width * 0.95
+    pygame.draw.line(screen, GREEN, (thr_pos, y_offset - 3), (thr_pos, y_offset + 23), 2)
+    text_thr = font_sidebar.render("Threshold 0.95", True, GREEN)
+    screen.blit(text_thr, (GRID_WIDTH + 20, y_offset + 25))
     y_offset += 50
 
-    # Controlli
-    text_auto = font_sidebar.render("SPAZIO: Auto-mode POMCP", True, BLACK)
-    screen.blit(text_auto, (GRID_WIDTH + 20, y_offset))
-    y_offset += 30
+    # Top 3 azioni (opzionale - per vedere alternative)
+    if pomcp_stats.get('top_actions', []):
+        text_top_header = font_sidebar.render("Top Actions:", True, BLACK)
+        screen.blit(text_top_header, (GRID_WIDTH + 20, y_offset))
+        y_offset += spacing
 
-    text_gif = font_sidebar.render("G: REC/STOP GIF", True, (100, 0, 100))
+        for idx, entry in enumerate(pomcp_stats.get('top_actions', [])[:3], start=1):
+            action_str = f"{idx}. {entry['action']}"
+            text_action = font_sidebar.render(action_str, True, BLACK)
+            screen.blit(text_action, (GRID_WIDTH + 30, y_offset))
+            y_offset += spacing
+
+            detail_label = f"   Q={entry['q']:.4f}, N={entry['n']}"
+            text_detail = font_sidebar.render(detail_label, True, BLACK)
+            screen.blit(text_detail, (GRID_WIDTH + 40, y_offset))
+            y_offset += spacing + 4
+
+        y_offset += 10
+
+    # Controlli
+    text_auto = font_sidebar.render("SPAZIO: Auto Mode", True, BLACK)
+    screen.blit(text_auto, (GRID_WIDTH + 20, y_offset))
+    y_offset += spacing
+
+    text_gif = font_sidebar.render("G: REC/STOP GIF", True, PURPLE)
     screen.blit(text_gif, (GRID_WIDTH + 20, y_offset))
-    y_offset += 30
+    y_offset += spacing
 
     text_restart = font_sidebar.render("R: Riavvia", True, BLACK)
     screen.blit(text_restart, (GRID_WIDTH + 20, y_offset))
-    y_offset += 30
+    y_offset += spacing
 
     text_quit = font_sidebar.render("ESC: Esci", True, BLACK)
     screen.blit(text_quit, (GRID_WIDTH + 20, y_offset))
@@ -749,16 +792,18 @@ def run_simulation(params):
     # Setup schermo
     map_size = params['map_size']
     cell_size = 60
-    sidebar_w = 400
+    sidebar_w = 480
     GRID_WIDTH = map_size * cell_size
     screen_w = GRID_WIDTH + sidebar_w
-    screen_h = map_size * cell_size
+    # Altezza minima per contenere tutti gli elementi della sidebar
+    min_height = 750
+    screen_h = max(map_size * cell_size, min_height)
 
     screen = pygame.display.set_mode((screen_w, screen_h))
     pygame.display.set_caption("Simulatore POMCP Drone Search")
 
     font_cell = pygame.font.SysFont(None, 18)
-    font_sidebar = pygame.font.SysFont(None, 24)
+    font_sidebar = pygame.font.SysFont(None, 20)
 
     # Setup stato
     belief_map = initialize_belief_map(params)
@@ -797,7 +842,9 @@ def run_simulation(params):
         'nodes': 0,
         'time': 0.0,
         'depth': 0,
-        'top_actions': []
+        'top_actions': [],
+        'best_action': ('Stay', 'Stay'),
+        'best_q': 0.0
     }
 
     while running:
@@ -816,6 +863,9 @@ def run_simulation(params):
                 pomcp_stats['time'] = elapsed
                 pomcp_stats['depth'] = solver.max_depth_reached
                 pomcp_stats['top_actions'] = solver.last_top_actions
+                pomcp_stats['best_action'] = best_action
+                # Estrai Q-value dell'azione migliore dal solver
+                pomcp_stats['best_q'] = solver.root.value_estimates.get(best_action, 0.0)
 
                 print(f"\nStep {steps_taken}: Azione scelta {best_action}")
 
@@ -881,11 +931,13 @@ def run_simulation(params):
             draw_static_background(background_surface, belief_map, font_cell, params)
             force_redraw = False
 
+        # Riempi l'intera finestra di bianco prima di disegnare
+        screen.fill((255, 255, 255))
         screen.blit(background_surface, (0, 0))
         draw_elements(
             screen, belief_map, drone_positions, params,
             font_sidebar, GRID_WIDTH, cell_size,
-            steps_taken, pomcp_stats
+            steps_taken, pomcp_stats, sidebar_w
         )
 
         if is_recording:
