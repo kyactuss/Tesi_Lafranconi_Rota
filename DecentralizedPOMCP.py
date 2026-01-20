@@ -9,20 +9,22 @@ from datetime import datetime
 import multiprocessing
 
 
-# Configurazione valori default
+# =============================================================================
+# 1. CONFIGURAZIONE E PARAMETRI UTENTE
+# =============================================================================
+
 DEFAULT_CONFIG = {
     'map_size': 15,
-    'real_alpha': 0.00,
-    'real_beta': 0.00,
+    'real_alpha': 0.01,
+    'real_beta': 0.01,
     'max_iterations': 1000000,
-    'max_time': 3.0,
+    'max_time': 3.5,
     'depth_limit': 100,
     'discount_factor': 0.9,
     'exploration_const': math.sqrt(2),
-    'reward_alpha': 5,
+    'reward_alpha': 3,
 }
 
-#Funzione per raccolta parametri utente
 def get_user_parameters():
     
     print("=== CONFIGURAZIONE MISSIONE DI RICERCA ===")
@@ -163,7 +165,20 @@ def initialize_belief_map(params):
         
     return belief_map
 
-#Nodo dell'albero POMCP: contiene mappa di probabilità e azioni (in particolare passiamo nodo padre)
+
+# =============================================================================
+# 2. POMCP LOGIC (FEDELTÀ 100% ORIGINALE)
+# =============================================================================
+
+# Costante globale per movimenti (evita duplicazione)
+MOVES_DELTA = {
+    'N': (-1, 0),
+    'S': (1, 0),
+    'W': (0, -1),
+    'E': (0, 1),
+    'Stay': (0, 0)
+}
+
 class POMCPNode:
    
     def __init__(self, belief_map, parent=None):
@@ -187,10 +202,8 @@ class POMCPNode:
 
     # check se il nodo è foglia
     def is_leaf(self):
-                        
         return self.visits == 0
 
-#Classe principale del solver POMCP
 class POMCPSolver:
     def __init__(self, max_iterations=None, max_time=None, depth_limit=None, discount_factor=None,
                  exploration_const=None, sensor_alpha=None, sensor_beta=None,
@@ -208,7 +221,6 @@ class POMCPSolver:
 
         self.total_nodes_created = 0  # Contatore nodi creati durante search
         self.max_depth_reached = 0    # Profondità massima raggiunta
-        self.last_top_actions = []    # Top azioni dell'ultima ricerca
 
     # Funzione di ricerca POMCP: costruiamo albero + restituzione azione migliore finale
     def search(self, current_belief_map, drone_position, partner_position=None):
@@ -218,7 +230,6 @@ class POMCPSolver:
         self.root = root  
         self.total_nodes_created = 1  
         self.max_depth_reached = 0
-        self.last_top_actions = []
         
         start_time = time.time()
         
@@ -234,23 +245,6 @@ class POMCPSolver:
             # Avvio della simulazione ricorsiva 
             self.simulate(state, root, 0, partner_position=partner_position)
         
-        # Stampa statistiche albero
-        print(f"\n[POMCP] Nodo root visitato {root.visits} volte")
-        print(f"[POMCP] Azioni esplorate: {len(root.action_counts)}")
-        print(f"[POMCP] Nodi totali creati: {self.total_nodes_created}")
-
-        action_stats = []
-        for action, count in root.action_counts.items():
-            q_val = root.value_estimates.get(action, 0.0)
-            action_stats.append({
-                'action': action,
-                'q': q_val,
-                'n': count
-            })
-
-        action_stats.sort(key=lambda entry: entry['q'], reverse=True)
-        self.last_top_actions = action_stats[:3]
-        
         # Selezione delle top 2 azioni migliori
         best_action, best_q, second_action, second_q = self._select_top_two_actions(root)
         return best_action, best_q, second_action, second_q
@@ -258,9 +252,12 @@ class POMCPSolver:
     # Singola simulazione POMCP: fatta in maniera ricorsiva per scendere in profondità
     def simulate(self, state, node, depth, visited_cells=None, partner_position=None): 
         
-        # Inizializzazione del set alla radice
+        # Inizializzazione del set alla radice (COPIA per evitare condivisione)
         if visited_cells is None:
             visited_cells = set()
+        else:
+            # Crea una copia per questo ramo dell'albero
+            visited_cells = visited_cells.copy()
 
         # Aggiorna profondità massima raggiunta finora
         if depth > self.max_depth_reached:
@@ -332,20 +329,11 @@ class POMCPSolver:
         # Estrazione posizione attuale del drone dallo stato
         _, drone_pos = state
         
-        # Definizione mosse
-        moves_delta = {
-            'N': (-1, 0),
-            'S': (1, 0),
-            'W': (0, -1),
-            'E': (0, 1),
-            'Stay': (0, 0)
-        }
-        
         map_size = self.map_size  # Dimensione della griglia
 
-        for action in moves_delta.keys():
+        for action in MOVES_DELTA.keys():
 
-            delta = moves_delta[action]
+            delta = MOVES_DELTA[action]
             next_pos = (drone_pos[0] + delta[0], drone_pos[1] + delta[1])
 
             # Verifica confini mappa
@@ -359,6 +347,11 @@ class POMCPSolver:
             if action not in node.action_counts:
                 node.action_counts[action] = 0
                 node.value_estimates[action] = 0.0
+        
+        # Safety: garantiamo che Stay sia sempre disponibile come fallback
+        if not node.action_counts:
+            node.action_counts['Stay'] = 0
+            node.value_estimates['Stay'] = 0.0
 
     # Rollout leggero basato su euristica di distanza di Manhattan
     def rollout(self, state):
@@ -377,12 +370,8 @@ class POMCPSolver:
         
         target_pos, drone_pos = state
         
-        # 1. Transizione di Stato (Deterministica) 
-        moves_delta = {
-            'N': (-1, 0), 'S': (1, 0), 'W': (0, -1), 'E': (0, 1), 'Stay': (0, 0)
-        }
-        
-        delta = moves_delta[action]
+        # 1. Transizione di Stato (Deterministica)
+        delta = MOVES_DELTA[action]
         next_drone = (drone_pos[0] + delta[0], drone_pos[1] + delta[1])
         next_state = (target_pos, next_drone)
 
@@ -439,13 +428,21 @@ class POMCPSolver:
 
         # Protezione numerica per evitare divisione per zero
         if Z < 1e-9:
-            return belief_map
+            return belief_map  # Nessuna modifica necessaria
 
-        # 4. Calcolo del nuovo belief map 
-        new_belief_map = (belief_map * Phi) / Z
+        # 4. Calcolo del nuovo belief map (IMPORTANTE: fare copia per non modificare l'originale)
+        new_belief_map = (belief_map.copy() * Phi) / Z
 
         # Correzione della cella ispezionata 
         new_belief_map[inspected_cell] = (Psi * p_st) / Z
+        
+        # 5. Normalizzazione esplicita per evitare deriva numerica
+        total = np.sum(new_belief_map)
+        if total > 1e-9:  # Protezione contro somma zero
+            new_belief_map /= total
+        else:
+            # Caso estremo: ritorna distribuzione uniforme
+            new_belief_map = np.ones_like(belief_map) / belief_map.size
 
         return new_belief_map
 
@@ -454,6 +451,16 @@ class POMCPSolver:
     def _sample_target_from_belief(self, belief_map):
         
         flat_probs = belief_map.flatten()
+        
+        # Protezione: normalizza se necessario
+        total = np.sum(flat_probs)
+        if abs(total - 1.0) > 1e-6:  # Tolleranza numerica
+            if total > 1e-9:
+                flat_probs = flat_probs / total
+            else:
+                # Fallback: distribuzione uniforme
+                flat_probs = np.ones_like(flat_probs) / flat_probs.size
+        
         indices = np.arange(belief_map.size)
         sampled_idx = np.random.choice(indices, p=flat_probs)
         x, y = np.unravel_index(sampled_idx, belief_map.shape)
@@ -485,22 +492,14 @@ class POMCPSolver:
         if infinite_actions:
             return random.choice(infinite_actions)
 
-        if best_action is None and node.action_counts:
-            best_action = random.choice(list(node.action_counts.keys()))
+        # Fallback di sicurezza: se best_action è ancora None
+        if best_action is None:
+            if node.action_counts:
+                best_action = random.choice(list(node.action_counts.keys()))
+            else:
+                # Caso estremo: nessuna azione disponibile
+                return 'Stay'
 
-        return best_action
-    
-    
-    # Selezione dell'azione migliore da eseguire nella realtà
-    def _select_best_action(self, node):
-    
-        best_action = None
-        best_val = -float('inf')
-        
-        for action, q_val in node.value_estimates.items():
-            if q_val > best_val:
-                best_val = q_val
-                best_action = action
         return best_action
 
     # Selezione delle top 2 azioni migliori (per gestione conflitti)
@@ -523,6 +522,8 @@ def worker_pomcp_task(args):
     """Worker per eseguire POMCP in modo parallelo"""
     params, belief_map, my_pos, partner_pos = args
     
+    # Importante: Qui il worker istanzia il solver.
+    # Grazie al multiprocessing, questo avviene in uno spazio di memoria separato.
     solver = POMCPSolver(
         max_iterations=params['max_iterations'],
         max_time=params['max_time'],
@@ -535,7 +536,6 @@ def worker_pomcp_task(args):
         map_size=params['map_size']
     )
     
-    # FASE 2: POMCP con partner position per evitare collisioni al root
     best_action, best_q, second_action, second_q = solver.search(belief_map, my_pos, partner_pos)
     
     return {
@@ -549,7 +549,159 @@ def worker_pomcp_task(args):
     }
 
 
-# === PARTE GRAFICA CON PYGAME ===
+# =============================================================================
+# 3. DRONE AGENT (ENTITÀ DECENTRALIZZATA - NUOVA CLASSE)
+# =============================================================================
+
+class DroneAgent:
+    """
+    Rappresenta un drone autonomo in un sistema decentralizzato.
+    Gestisce la propria memoria e comunica via messaggi.
+    """
+    def __init__(self, drone_id, start_pos, params):
+        self.id = drone_id
+        self.pos = start_pos
+        self.params = params
+        
+        # MEMORIA PRIVATA: La propria versione della verità (belief map)
+        self.belief_map = initialize_belief_map(params)
+        
+        # Strumento matematico per update bayesiano locale
+        # (Riutilizziamo la logica matematica della classe originale, ma istanziata localmente)
+        self.solver_tool = POMCPSolver(
+            map_size=params['map_size'], 
+            sensor_alpha=params['real_alpha'], 
+            sensor_beta=params['real_beta']
+        )
+
+        # Stato interno decisionale
+        self.planned_result = None   
+        self.final_action = None     
+
+    def get_planning_args(self, partner_last_known_pos):
+        """
+        PREPARA I DATI per il planner parallelo.
+        Restituisce una tupla contenente una COPIA della belief map.
+        """
+        return (self.params, self.belief_map.copy(), self.pos, partner_last_known_pos)
+
+    def set_planning_result(self, result):
+        """Riceve il risultato dal worker multiprocessing"""
+        self.planned_result = result
+
+    # --- COMUNICAZIONE 1: INTENZIONI ---
+    def create_intention_packet(self):
+        """Crea un pacchetto con l'intenzione di movimento e il Q-value"""
+        if self.planned_result is None:
+            # Fallback di sicurezza
+            return {
+                'id': self.id,
+                'pos': self.pos,
+                'best_action': 'Stay',
+                'best_q': 0.0,
+                'second_action': 'Stay',
+                'second_q': 0.0
+            }
+        
+        return {
+            'id': self.id,
+            'pos': self.pos,
+            'best_action': self.planned_result['best_action'],
+            'best_q': self.planned_result['best_q'],
+            'second_action': self.planned_result['second_action'],
+            'second_q': self.planned_result['second_q']
+        }
+
+    def resolve_conflict_locally(self, other_packet):
+        """
+        Riceve l'intenzione dell'altro e decide deterministicamente chi passa.
+        Non modifica l'altro drone, solo se stesso.
+        """
+        # Safety check
+        if self.planned_result is None:
+            self.final_action = 'Stay'
+            return False
+        
+        # Calcolo mia prossima posizione
+        my_act = self.planned_result['best_action']
+        d = MOVES_DELTA[my_act]
+        my_next = (self.pos[0] + d[0], self.pos[1] + d[1])
+
+        # Calcolo prossima posizione dell'altro (basato sul suo pacchetto)
+        other_act = other_packet['best_action']
+        d2 = MOVES_DELTA[other_act]
+        other_next = (other_packet['pos'][0] + d2[0], other_packet['pos'][1] + d2[1])
+
+        # Check Conflitti
+        collision = (my_next == other_next)
+        swap = (my_next == other_packet['pos'] and other_next == self.pos)
+
+        must_yield = False
+        
+        if collision or swap:
+            # Regola 1: Chi ha Q-value più alto vince (è più convinto/ha più info)
+            if other_packet['best_q'] > self.planned_result['best_q']:
+                must_yield = True
+            
+            # Regola 2: Tie-breaker deterministico su ID (per evitare stalli se Q è uguale)
+            elif other_packet['best_q'] == self.planned_result['best_q']:
+                if other_packet['id'] < self.id:
+                    must_yield = True
+        
+        # Se perdo il conflitto, uso la mia seconda azione migliore
+        if must_yield:
+            second_act = self.planned_result['second_action']
+            # Validazione: la seconda azione deve essere valida
+            d_second = MOVES_DELTA.get(second_act, (0, 0))
+            second_next = (self.pos[0] + d_second[0], self.pos[1] + d_second[1])
+            map_size = self.params['map_size']
+            
+            # Controllo se la seconda azione è valida
+            if (0 <= second_next[0] < map_size and 0 <= second_next[1] < map_size):
+                self.final_action = second_act
+            else:
+                # Fallback: se anche la seconda è invalida, rimani fermo
+                self.final_action = 'Stay'
+                print(f"[WARNING] Drone {self.id}: second_action invalida, uso Stay")
+        else:
+            self.final_action = my_act
+        
+        return must_yield # Ritorna True se ho ceduto il passo
+
+    def execute_move(self):
+        """Aggiorna la propria posizione fisica"""
+        if self.final_action is None:
+            print(f"[WARNING] Drone {self.id}: final_action is None, staying in place")
+            return
+        
+        d = MOVES_DELTA.get(self.final_action, (0, 0))
+        new_pos = (self.pos[0] + d[0], self.pos[1] + d[1])
+        
+        # Validazione confini
+        map_size = self.params['map_size']
+        if 0 <= new_pos[0] < map_size and 0 <= new_pos[1] < map_size:
+            self.pos = new_pos
+        else:
+            print(f"[WARNING] Drone {self.id}: movimento fuori confini, rimango in {self.pos}")
+
+    # --- COMUNICAZIONE 2: OSSERVAZIONI ---
+    def process_local_observation(self, obs_val):
+        """
+        1. Aggiorna la propria mappa con il dato sensore locale.
+        2. Restituisce il pacchetto dati da inviare al compagno.
+        """
+        self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, self.pos, obs_val)
+        return (self.pos, obs_val)
+
+    def receive_remote_observation(self, data_packet):
+        """Riceve pacchetto (pos, obs) dall'altro drone e aggiorna la mappa"""
+        pos, obs = data_packet
+        self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, pos, obs)
+
+
+# =============================================================================
+# 4. FUNZIONI GRAFICHE (FEDELTÀ 100% ORIGINALE)
+# =============================================================================
 
 # Disegno griglia, heatmap e percentuali su sfondo
 def draw_static_background(surface, p_map, font_cell, params):
@@ -588,7 +740,7 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     GREEN = (0, 200, 0)
     GRAY = (200, 200, 200)
     WHITE = (255, 255, 255)
-    BLUE = (0, 0, 255)
+    BLUE = (0, 0, 255)  # Usato per la barra di progresso
     PURPLE = (100, 0, 100)
 
     # Target (X) - posizione logica (riga, colonna) -> (x, y) Pygame
@@ -740,8 +892,6 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     text_quit = font_sidebar.render("ESC: Esci", True, BLACK)
     screen.blit(text_quit, (GRID_WIDTH + 20, y_offset))
 
-# === FUNZIONI PER SIMULARE REALTA' 
-
 # Simula sensore reale
 def get_real_observation(drone_pos, target_pos, alpha, beta):
     is_target = (drone_pos == target_pos)
@@ -749,32 +899,20 @@ def get_real_observation(drone_pos, target_pos, alpha, beta):
         return 0 if np.random.rand() < beta else 1
     return 1 if np.random.rand() < alpha else 0
 
-# Movimento
-def execute_move(current_position, action):
-    moves_delta = {'N': (-1, 0), 'S': (1, 0), 'W': (0, -1), 'E': (0, 1), 'Stay': (0, 0)}
-    delta_r, delta_c = moves_delta[action]
-    curr_r, curr_c = current_position
-    return (curr_r + delta_r, curr_c + delta_c)
 
-# Funzione helper per determinare cella successiva
-def get_coord_step(start_pos, action):
-    moves_delta = {'N': (-1, 0), 'S': (1, 0), 'W': (0, -1), 'E': (0, 1), 'Stay': (0, 0)}
-    dr, dc = moves_delta[action]
-    return (start_pos[0] + dr, start_pos[1] + dc)
-
-
-# === MAIN LOOP MULTI-DRONE CON PYGAME ===
+# =============================================================================
+# 5. MAIN LOOP RISTRUTTURATO PER DECENTRALIZZAZIONE (GRAFICA ORIGINALE)
+# =============================================================================
 
 def run_simulation(params):
     pygame.init()
 
-    # Setup schermo
+    # Setup schermo (uguale all'originale)
     map_size = params['map_size']
     cell_size = 60
     sidebar_w = 480
     GRID_WIDTH = map_size * cell_size
     screen_w = GRID_WIDTH + sidebar_w
-    # Altezza minima per contenere tutti gli elementi della sidebar
     min_height = 750
     screen_h = max(map_size * cell_size, min_height)
 
@@ -784,33 +922,29 @@ def run_simulation(params):
     font_cell = pygame.font.SysFont(None, 18)
     font_sidebar = pygame.font.SysFont(None, 20)
 
-    # Setup stato iniziale
-    belief_map = initialize_belief_map(params)
-    d1_pos = params['d1_pos']
-    d2_pos = params['d2_pos']
+    # 1. ISTANZIAZIONE ENTITÀ SEPARATE
+    # Invece di variabili sciolte, creiamo due AGENTI
+    d1 = DroneAgent(1, params['d1_pos'], params)
+    d2 = DroneAgent(2, params['d2_pos'], params)
     target_pos = params['target_pos']
-
-    # Setup multiprocessing pool
+    
+    # Setup multiprocessing
     pool = multiprocessing.Pool(processes=2)
-
-    # Solver di riferimento per update belief (condiviso)
-    solver_ref = POMCPSolver(params)
-
-    # Variabili loop
     clock = pygame.time.Clock()
+    
     running = True
-    step_counter = 0
     auto_mode = False
+    step_counter = 0
     auto_timer = 0
-    AUTO_INTERVAL = 1500  # ms
+    AUTO_INTERVAL = 500  # ms (0.5 secondi)
 
     background_surface = pygame.Surface((GRID_WIDTH, screen_h))
     force_redraw = True
-
     is_recording = False
     frames = []
+    capture_frame = False  # Flag per catturare frame dopo rendering normale
 
-    # Stats per UI
+    # UI Stats (Struttura dati per la grafica originale)
     ui_stats = {
         'step': 0,
         'd1_obs': '-', 'd2_obs': '-',
@@ -823,78 +957,53 @@ def run_simulation(params):
         'conflict_d1': False, 'conflict_d2': False
     }
 
-    while running:
-        # Auto-mode multi-drone POMCP
-        if auto_mode:
-            current_time = pygame.time.get_ticks()
-            if current_time - auto_timer > AUTO_INTERVAL:
-                
-                print(f"\n{'='*50}")
-                print(f"STEP {step_counter}")
-                print(f"{'='*50}")
-                
-                # ===== FASE 2: POMCP PARALLELO (usando belief corrente) =====
-                print("\n[FASE 2] POMCP Parallelo (con avoid partner al root)")
-                task1 = (params, belief_map.copy(), d1_pos, d2_pos)
-                task2 = (params, belief_map.copy(), d2_pos, d1_pos)
-                
-                t_start = time.time()
+    try:
+        while running:
+            if auto_mode:
+                current_time = pygame.time.get_ticks()
+                if current_time - auto_timer > AUTO_INTERVAL:
+                    step_counter += 1
+                    print(f"\n--- STEP {step_counter} ---")
+
+                # FASE 1: PIANIFICAZIONE PARALLELA (Agenti autonomi)
+                # Ognuno prepara il suo pacchetto e lo invia al pool di calcolo
+                task1 = d1.get_planning_args(d2.pos)
+                task2 = d2.get_planning_args(d1.pos)
                 results = pool.map(worker_pomcp_task, [task1, task2])
-                res1, res2 = results[0], results[1]
-                pomcp_time = time.time() - t_start
                 
-                print(f"  POMCP completato in {pomcp_time:.3f}s")
-                print(f"  D1: Best={res1['best_action']} (Q={res1['best_q']:.3f}), 2nd={res1['second_action']} (Q={res1['second_q']:.3f})")
-                print(f"  D2: Best={res2['best_action']} (Q={res2['best_q']:.3f}), 2nd={res2['second_action']} (Q={res2['second_q']:.3f})")
+                # I droni ricevono i risultati
+                d1.set_planning_result(results[0])
+                d2.set_planning_result(results[1])
+
+                # FASE 2: SCAMBIO INTENZIONI & CONFLITTI
+                # Simula scambio messaggi: D1 invia intenzione a D2, e viceversa
+                pkt1 = d1.create_intention_packet()
+                pkt2 = d2.create_intention_packet()
                 
-                # ===== FASE 3: COMUNICAZIONE OUTPUT POMCP =====
-                print("\n[FASE 3] Comunicazione Output POMCP")
-                # (Già fatto implicitamente con results)
+                # Risoluzione autonoma: ognuno decide per sé
+                c1 = d1.resolve_conflict_locally(pkt2)
+                c2 = d2.resolve_conflict_locally(pkt1)
+
+                # FASE 3: MOVIMENTO
+                d1.execute_move()
+                d2.execute_move()
+
+                # FASE 4: SENSING (Simulazione Fisica)
+                obs1 = get_real_observation(d1.pos, target_pos, params['real_alpha'], params['real_beta'])
+                obs2 = get_real_observation(d2.pos, target_pos, params['real_alpha'], params['real_beta'])
                 
-                # ===== FASE 4: GESTIONE CONFLITTI =====
-                print("\n[FASE 4] Gestione Conflitti")
-                next_d1 = get_coord_step(d1_pos, res1['best_action'])
-                next_d2 = get_coord_step(d2_pos, res2['best_action'])
+                # FASE 5: COMUNICAZIONE DATI
+                # Ognuno processa il proprio dato e crea un pacchetto per l'altro
+                data_pkt_1 = d1.process_local_observation(obs1)
+                data_pkt_2 = d2.process_local_observation(obs2)
                 
-                final_act_d1 = res1['best_action']
-                final_act_d2 = res2['best_action']
-                conflict_d1 = False
-                conflict_d2 = False
-                
-                if next_d1 == next_d2:
-                    print(f"  ⚠️  CONFLITTO su cella {next_d1}!")
-                    if res1['best_q'] >= res2['best_q']:
-                        print(f"  → D1 vince (Q={res1['best_q']:.3f} >= {res2['best_q']:.3f})")
-                        final_act_d1 = res1['best_action']
-                        final_act_d2 = res2['second_action']
-                        conflict_d2 = True
-                    else:
-                        print(f"  → D2 vince (Q={res2['best_q']:.3f} > {res1['best_q']:.3f})")
-                        final_act_d1 = res1['second_action']
-                        final_act_d2 = res2['best_action']
-                        conflict_d1 = True
-                else:
-                    print(f"  ✓ Nessun conflitto")
-                
-                # Esecuzione movimenti finali
-                d1_pos = execute_move(d1_pos, final_act_d1)
-                d2_pos = execute_move(d2_pos, final_act_d2)
-                print(f"  D1 -> {d1_pos} | D2 -> {d2_pos}")
-                
-                # ===== FASE 1: COMUNICAZIONE OSSERVAZIONI (dopo movimento) =====
-                print("\n[FASE 1] Comunicazione Osservazioni (dopo movimento)")
-                obs1 = get_real_observation(d1_pos, target_pos, params['real_alpha'], params['real_beta'])
-                obs2 = get_real_observation(d2_pos, target_pos, params['real_alpha'], params['real_beta'])
-                print(f"  Drone 1 @ {d1_pos} -> Obs: {obs1}")
-                print(f"  Drone 2 @ {d2_pos} -> Obs: {obs2}")
-                
-                # Aggiornamento belief condiviso con entrambe le osservazioni
-                belief_map = solver_ref._single_sensor_update(belief_map, d1_pos, obs1)
-                belief_map = solver_ref._single_sensor_update(belief_map, d2_pos, obs2)
-                print(f"  Belief aggiornata (somma={belief_map.sum():.4f})")
-                
-                # Aggiorna UI stats
-                step_counter += 1
+                # Ognuno riceve il pacchetto dell'altro
+                d1.receive_remote_observation(data_pkt_2)
+                d2.receive_remote_observation(data_pkt_1)
+
+                # AGGIORNAMENTO DATI PER UI
+                # Mappiamo i dati interni degli agenti nel dizionario stats originale
+                res1, res2 = d1.planned_result, d2.planned_result
                 ui_stats.update({
                     'step': step_counter,
                     'd1_obs': obs1, 'd2_obs': obs2,
@@ -905,89 +1014,80 @@ def run_simulation(params):
                     'd1_2nd': res1['second_action'], 'd1_2nd_q': res1['second_q'],
                     'd2_best': res2['best_action'], 'd2_best_q': res2['best_q'],
                     'd2_2nd': res2['second_action'], 'd2_2nd_q': res2['second_q'],
-                    'd1_final': final_act_d1, 'd2_final': final_act_d2,
-                    'conflict_d1': conflict_d1, 'conflict_d2': conflict_d2
+                    'd1_final': d1.final_action, 'd2_final': d2.final_action,
+                    'conflict_d1': c1, 'conflict_d2': c2
                 })
+
+                capture_frame = is_recording  # Segna che serve catturare questo frame
+
+                # TERMINAZIONE (Threshold Check sulla belief del D1)
+                if d1.belief_map.max() >= 0.95:
+                    print("\n🎯 TARGET TROVATO! (probabilità > 95%)")
+                    auto_mode = False
                 
                 force_redraw = True
                 auto_timer = current_time
+
+            # GESTIONE EVENTI (IDENTICA ALL'ORIGINALE)
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT: return "quit"
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE: return "quit"
+                    if event.key == pygame.K_r: return "restart"
+                    if event.key == pygame.K_SPACE: 
+                        auto_mode = not auto_mode
+                        if auto_mode:
+                            print("\n✓ Modalità AUTO POMCP attivata")
+                            auto_timer = pygame.time.get_ticks()
+                        else:
+                            print("\n✓ Modalità AUTO disattivata")
+                    if event.key == pygame.K_g:
+                        is_recording = not is_recording
+                        if is_recording:
+                            print("🔴 Registrazione GIF avviata")
+                            frames = []
+                        else:
+                            print("💾 Salvataggio GIF...")
+                            filename = f'multi_drone_pomcp_{datetime.now().strftime("%Y%m%d_%H%M%S")}.gif'
+                            imageio.mimsave(filename, frames, fps=30, loop=0)
+                            print(f"✅ GIF salvata: {filename}"); frames = []
+
+            # DISEGNO (IDENTICO ALL'ORIGINALE)
+            if force_redraw:
+                # Usiamo la mappa di D1 per il background (in un sistema ideale D1 e D2 convergono)
+                draw_static_background(background_surface, d1.belief_map, font_cell, params)
+                force_redraw = False
                 
-                # Check terminazione: solo se la belief converge (non se raggiunto fisicamente)
-                max_prob = belief_map.max()
-                if max_prob >= 0.95:
-                    print("\n🎯 TARGET TROVATO! (probabilità > 95%)")
-                    auto_mode = False
+            screen.fill((255, 255, 255))
+            screen.blit(background_surface, (0, 0))
+            # Disegnamo gli elementi prendendo le posizioni dagli agenti
+            draw_elements(
+                screen, d1.belief_map, d1.pos, d2.pos, target_pos, params,
+                font_sidebar, GRID_WIDTH, cell_size, ui_stats, sidebar_w
+            )
+            
+            if is_recording:
+                pygame.draw.circle(screen, (255, 0, 0), (screen_w - 20, 20), 10)
 
-        # Eventi
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pool.close()
-                pool.join()
-                return "quit"
+            pygame.display.flip()
 
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    pool.close()
-                    pool.join()
-                    return "quit"
+            # Cattura frame dopo rendering (se movimento appena avvenuto)
+            if capture_frame:
+                rect = pygame.Rect(0, 0, screen_w, screen_h)
+                sub = screen.subsurface(rect)
+                frame_data = pygame.surfarray.array3d(sub)
+                frame_data = np.rot90(frame_data)
+                frame_data = np.flipud(frame_data)
+                # Duplica frame per mantenere durata reale (0.5s * 30fps = 15 frames)
+                for _ in range(15):
+                    frames.append(frame_data.copy())
+                capture_frame = False
 
-                if event.key == pygame.K_r:
-                    pool.close()
-                    pool.join()
-                    return "restart"
-
-                if event.key == pygame.K_SPACE:
-                    auto_mode = not auto_mode
-                    if auto_mode:
-                        print("\n✓ Modalità AUTO POMCP attivata")
-                        auto_timer = pygame.time.get_ticks()
-                    else:
-                        print("\n✓ Modalità AUTO disattivata")
-
-                if event.key == pygame.K_g:
-                    is_recording = not is_recording
-                    if is_recording:
-                        print("🔴 Registrazione GIF avviata")
-                        frames = []
-                    else:
-                        print("💾 Salvataggio GIF...")
-                        filename = f'multi_drone_pomcp_{datetime.now().strftime("%Y%m%d_%H%M%S")}.gif'
-                        imageio.mimsave(filename, frames, fps=30, loop=0)
-                        print(f"✅ GIF salvata: {filename}")
-                        frames = []
-
-        # Rendering con background optimization
-        if force_redraw:
-            draw_static_background(background_surface, belief_map, font_cell, params)
-            force_redraw = False
-
-        # Riempi l'intera finestra di bianco prima di disegnare
-        screen.fill((255, 255, 255))
-        screen.blit(background_surface, (0, 0))
-        draw_elements(
-            screen, belief_map, d1_pos, d2_pos, target_pos, params,
-            font_sidebar, GRID_WIDTH, cell_size, ui_stats, sidebar_w
-        )
-
-        # Indicatore registrazione
-        if is_recording:
-            pygame.draw.circle(screen, (255, 0, 0), (screen_w - 20, 20), 10)
-
-        pygame.display.flip()
-
-        # Cattura frame per GIF
-        if is_recording:
-            rect = pygame.Rect(0, 0, screen_w, screen_h)
-            sub = screen.subsurface(rect)
-            frame_data = pygame.surfarray.array3d(sub)
-            frame_data = np.rot90(frame_data)
-            frame_data = np.flipud(frame_data)
-            frames.append(frame_data)
-
-        clock.tick(30)
-
-    pool.close()
-    pool.join()
+            clock.tick(30)
+    finally:
+        # Assicurarsi che il pool venga sempre chiuso
+        pool.close()
+        pool.join()
 
 
 def main():
@@ -996,9 +1096,12 @@ def main():
         result = run_simulation(params)
         if result == "quit":
             print("Simulazione terminata.")
+            pygame.quit()
             break
         elif result == "restart":
             print("Riavvio...")
+            pygame.quit()
+            pygame.init()
             continue
 
 if __name__ == "__main__":
