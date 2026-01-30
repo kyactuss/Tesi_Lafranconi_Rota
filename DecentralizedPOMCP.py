@@ -105,6 +105,23 @@ def get_user_parameters():
                 'cov': [sx, sy] # Usiamo lista per costruire matrice diagonale poi
             })
 
+    # Configurazione Ostacoli
+    print("\n--- Configurazione Ostacoli ---")
+    obstacles = []
+    while True:
+        try:
+            num_obstacles = int(input("Quanti ostacoli vuoi inserire? "))
+            if num_obstacles >= 0:
+                break
+            print("Numero ostacoli deve essere >= 0")
+        except ValueError:
+            print("Inserisci un numero valido.")
+    
+    for i in range(num_obstacles):
+        print(f"\nOstacolo #{i+1}:")
+        obs_pos = _get_coord(f"posizione ostacolo #{i+1}")
+        obstacles.append(obs_pos)
+
     # Restituzione dizionario parametri
     return {
         'map_size': map_size,
@@ -119,8 +136,25 @@ def get_user_parameters():
         'd1_pos': d1_pos,
         'd2_pos': d2_pos,
         'target_pos': target_pos,
-        'map_config': map_config
+        'map_config': map_config,
+        'obstacles': obstacles
     }
+
+# Funzione per generazione della mappa degli ostacoli
+def initialize_obstacle_map(params):
+    """
+    Crea una mappa booleana per gli ostacoli.
+    1 = cella con ostacolo
+    0 = cella libera
+    """
+    map_size = params['map_size']
+    obstacle_map = np.zeros((map_size, map_size), dtype=int)
+    
+    for obs_pos in params['obstacles']:
+        r, c = obs_pos
+        obstacle_map[r, c] = 1
+    
+    return obstacle_map
 
 # Funzione per generazione della mappa di probabilità
 def initialize_belief_map(params):
@@ -154,11 +188,20 @@ def initialize_belief_map(params):
             # Aggiunta PDF alla mappa + discretizzazione della probabilità
             belief_map += rv.pdf(coord)
 
+    # Applicazione ostacoli PRIMA della normalizzazione
+    # Se è presente un ostacolo, la probabilità cade a zero
+    if 'obstacles' in params and len(params['obstacles']) > 0:
+        obstacle_map = initialize_obstacle_map(params)
+        # Moltiplica ogni cella per (1 - presenza_ostacolo)
+        # Se presenza_ostacolo = 1, la probabilità diventa 0
+        # Se presenza_ostacolo = 0, la probabilità resta invariata
+        belief_map = belief_map * (1 - obstacle_map)
+    
     # Normalizzazione della mappa + check somma di tutte le celle deve fare 1.0 
     total_prob = np.sum(belief_map)
     
     if total_prob == 0:
-        # Fallback di sicurezza per valori di varianze enormi
+        # Fallback di sicurezza per valori di varianze enormi o troppi ostacoli
         belief_map.fill(1.0 / (map_size * map_size))
     else:
         belief_map /= total_prob
@@ -178,6 +221,68 @@ MOVES_DELTA = {
     'E': (0, 1),
     'Stay': (0, 0)
 }
+
+def precompute_all_pairs_distances(map_size, obstacle_map):
+    """
+    Pre-calcola TUTTE le distanze tra coppie di celle libere usando BFS.
+    Tiene conto dei muri (obstacle_map) per calcolare la distanza reale.
+    
+    Args:
+        map_size: Dimensione della mappa (NxN)
+        obstacle_map: Matrice NxN dove 1 = ostacolo, 0 = libero
+    
+    Returns:
+        dist_lookup: Dizionario {(start_pos, end_pos): distanza}
+                     Se la coppia non esiste, significa che end_pos è irraggiungibile da start_pos
+    """
+    from collections import deque
+    
+    dist_lookup = {}
+    
+    # Direzioni di movimento (escluso 'Stay' perché cerchiamo il percorso più breve)
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # N, S, W, E
+    
+    # Itera su ogni cella libera come punto di partenza
+    for start_r in range(map_size):
+        for start_c in range(map_size):
+            start_pos = (start_r, start_c)
+            
+            # Salta ostacoli
+            if obstacle_map[start_r, start_c] == 1:
+                continue
+            
+            # BFS da questa cella verso tutte le altre
+            queue = deque([(start_pos, 0)])  # (posizione, distanza)
+            visited = {start_pos}
+            
+            while queue:
+                current_pos, dist = queue.popleft()
+                
+                # Salva la distanza nella lookup table
+                dist_lookup[(start_pos, current_pos)] = dist
+                
+                # Esplora i vicini
+                for dr, dc in directions:
+                    next_r = current_pos[0] + dr
+                    next_c = current_pos[1] + dc
+                    next_pos = (next_r, next_c)
+                    
+                    # Verifica limiti della mappa
+                    if not (0 <= next_r < map_size and 0 <= next_c < map_size):
+                        continue
+                    
+                    # Salta ostacoli
+                    if obstacle_map[next_r, next_c] == 1:
+                        continue
+                    
+                    # Salta se già visitato
+                    if next_pos in visited:
+                        continue
+                    
+                    visited.add(next_pos)
+                    queue.append((next_pos, dist + 1))
+    
+    return dist_lookup
 
 class POMCPNode:
    
@@ -207,7 +312,7 @@ class POMCPNode:
 class POMCPSolver:
     def __init__(self, max_iterations=None, max_time=None, depth_limit=None, discount_factor=None,
                  exploration_const=None, sensor_alpha=None, sensor_beta=None,
-                 reward_alpha=None, map_size=None):
+                 reward_alpha=None, map_size=None, obstacle_map=None):
         cfg = DEFAULT_CONFIG
         self.max_iterations = max_iterations if max_iterations is not None else cfg['max_iterations']
         self.max_time = max_time if max_time is not None else cfg['max_time']
@@ -218,9 +323,14 @@ class POMCPSolver:
         self.sensor_beta = sensor_beta if sensor_beta is not None else cfg['real_beta']
         self.reward_alpha = reward_alpha if reward_alpha is not None else cfg['reward_alpha']
         self.map_size = map_size if map_size is not None else cfg['map_size']
+        self.obstacle_map = obstacle_map if obstacle_map is not None else np.zeros((self.map_size, self.map_size), dtype=int)
 
         self.total_nodes_created = 0  # Contatore nodi creati durante search
         self.max_depth_reached = 0    # Profondità massima raggiunta
+        
+        # PRE-CALCOLO LOOKUP TABLE: Calcola TUTTE le distanze tra coppie di celle all'avvio
+        # Questo viene fatto UNA SOLA VOLTA e poi riutilizzato per tutti i rollout
+        self.dist_lookup = precompute_all_pairs_distances(self.map_size, self.obstacle_map)
 
     # Funzione di ricerca POMCP: costruiamo albero + restituzione azione migliore finale
     def search(self, current_belief_map, drone_position, partner_position=None):
@@ -340,6 +450,10 @@ class POMCPSolver:
             if not (0 <= next_pos[0] < map_size and 0 <= next_pos[1] < map_size):
                 continue
 
+            # VIETARE celle con ostacoli
+            if self.obstacle_map[next_pos[0], next_pos[1]] == 1:
+                continue
+
             # FASE 2: Escludiamo posizione partner solo al root
             if partner_position is not None and next_pos == partner_position:
                 continue
@@ -353,15 +467,21 @@ class POMCPSolver:
             node.action_counts['Stay'] = 0
             node.value_estimates['Stay'] = 0.0
 
-    # Rollout leggero basato su euristica di distanza di Manhattan
+    # Rollout leggero basato su euristica di distanza REALE (con lookup table)
     def rollout(self, state):
         
         target_pos, drone_pos = state
         
-        # Calcolo distanza di Manhattan
-        dist = abs(target_pos[0] - drone_pos[0]) + abs(target_pos[1] - drone_pos[1])
+        # OTTIMIZZAZIONE: Lettura O(1) dalla lookup table invece di calcolo
+        # La distanza tiene conto dei muri (distanza reale, non Manhattan)
+        dist = self.dist_lookup.get((drone_pos, target_pos))
         
-        # Reward decrescente con la distanza
+        # Se la coppia non esiste nella lookup, il target è irraggiungibile
+        # Restituiamo una reward molto bassa (distanza infinita)
+        if dist is None:
+            return 0.0  # Reward minima per target irraggiungibile
+        
+        # Reward decrescente con la distanza REALE
         score = 1 * (self.gamma ** dist)
         return score
 
@@ -436,13 +556,23 @@ class POMCPSolver:
         # Correzione della cella ispezionata 
         new_belief_map[inspected_cell] = (Psi * p_st) / Z
         
+        # Applicazione ostacoli: azzera probabilità nelle celle con ostacoli
+        new_belief_map = new_belief_map * (1 - self.obstacle_map)
+        
         # 5. Normalizzazione esplicita per evitare deriva numerica
+        # Rinormalizziamo sulla somma totale delle celle libere
         total = np.sum(new_belief_map)
         if total > 1e-9:  # Protezione contro somma zero
             new_belief_map /= total
         else:
-            # Caso estremo: ritorna distribuzione uniforme
-            new_belief_map = np.ones_like(belief_map) / belief_map.size
+            # Caso estremo: ritorna distribuzione uniforme SOLO sulle celle libere
+            free_cells_mask = (1 - self.obstacle_map)
+            num_free_cells = np.sum(free_cells_mask)
+            if num_free_cells > 0:
+                new_belief_map = free_cells_mask / num_free_cells
+            else:
+                # Caso estremo: nessuna cella libera (non dovrebbe mai accadere)
+                new_belief_map = np.ones_like(belief_map) / belief_map.size
 
         return new_belief_map
 
@@ -522,6 +652,9 @@ def worker_pomcp_task(args):
     """Worker per eseguire POMCP in modo parallelo"""
     params, belief_map, my_pos, partner_pos = args
     
+    # Creazione mappa ostacoli
+    obstacle_map = initialize_obstacle_map(params) if 'obstacles' in params else np.zeros((params['map_size'], params['map_size']), dtype=int)
+    
     # Importante: Qui il worker istanzia il solver.
     # Grazie al multiprocessing, questo avviene in uno spazio di memoria separato.
     solver = POMCPSolver(
@@ -533,7 +666,8 @@ def worker_pomcp_task(args):
         sensor_alpha=params['real_alpha'],
         sensor_beta=params['real_beta'],
         reward_alpha=params['reward_alpha'],
-        map_size=params['map_size']
+        map_size=params['map_size'],
+        obstacle_map=obstacle_map
     )
     
     best_action, best_q, second_action, second_q = solver.search(belief_map, my_pos, partner_pos)
@@ -566,12 +700,16 @@ class DroneAgent:
         # MEMORIA PRIVATA: La propria versione della verità (belief map)
         self.belief_map = initialize_belief_map(params)
         
+        # Mappa ostacoli (condivisa tra tutti)
+        self.obstacle_map = initialize_obstacle_map(params) if 'obstacles' in params else np.zeros((params['map_size'], params['map_size']), dtype=int)
+        
         # Strumento matematico per update bayesiano locale
         # (Riutilizziamo la logica matematica della classe originale, ma istanziata localmente)
         self.solver_tool = POMCPSolver(
             map_size=params['map_size'], 
             sensor_alpha=params['real_alpha'], 
-            sensor_beta=params['real_beta']
+            sensor_beta=params['real_beta'],
+            obstacle_map=self.obstacle_map
         )
 
         # Stato interno decisionale
@@ -709,28 +847,38 @@ def draw_static_background(surface, p_map, font_cell, params):
     GRID_WIDTH = surface.get_width()
     CELL_SIZE = GRID_WIDTH // params['map_size']
     BLACK = (0, 0, 0)
+    RED = (255, 0, 0)
 
     surface.fill((255, 255, 255))
     max_prob = p_map.max()
+    
+    # Ottieni mappa ostacoli se presente
+    obstacle_map = initialize_obstacle_map(params) if 'obstacles' in params else None
 
     for r in range(params['map_size']):
         for c in range(params['map_size']):
             prob = p_map[r, c]
 
-            # Heatmap: blu più scuro = probabilità più alta
-            color_val = 0
-            if max_prob > 1e-9:
-                color_val = int(255 * (prob / max_prob))
-            color = (max(0, 255 - color_val), max(0, 255 - color_val), 255)
+            # Controlla se c'è un ostacolo in questa cella
+            if obstacle_map is not None and obstacle_map[r, c] == 1:
+                # Cella con ostacolo: colorala interamente di rosso
+                color = RED
+            else:
+                # Heatmap: blu più scuro = probabilità più alta
+                color_val = 0
+                if max_prob > 1e-9:
+                    color_val = int(255 * (prob / max_prob))
+                color = (max(0, 255 - color_val), max(0, 255 - color_val), 255)
 
             # In Pygame: x = colonna (c), y = riga (r)
             rect = pygame.Rect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE)
             pygame.draw.rect(surface, color, rect)
             pygame.draw.rect(surface, BLACK, rect, 1)
 
-            # Testo probabilità
-            text = font_cell.render(f"{prob * 100:.3f}%", True, BLACK)
-            surface.blit(text, (c * CELL_SIZE + 5, r * CELL_SIZE + 5))
+            # Testo probabilità (non mostrarlo sugli ostacoli)
+            if obstacle_map is None or obstacle_map[r, c] == 0:
+                text = font_cell.render(f"{prob * 100:.3f}%", True, BLACK)
+                surface.blit(text, (c * CELL_SIZE + 5, r * CELL_SIZE + 5))
 
 # Funzioni per disegnare elementi dinamici: droni, target e barra laterale (2 droni)
 def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_sidebar, GRID_WIDTH, CELL_SIZE, stats, SIDEBAR_WIDTH):
@@ -765,12 +913,12 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     pygame.draw.rect(screen, GRAY, sidebar_rect)
 
     # Statistiche
-    y_offset = 20
-    spacing = 22
+    y_offset = 10
+    spacing = 18  # Ridotto da 22 a 18
 
     text_step = font_sidebar.render(f"Step: {stats['step']}", True, BLACK)
     screen.blit(text_step, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing + 8
+    y_offset += spacing + 5  # Ridotto da 8 a 5
 
     # Drone 1 info
     text_d1 = font_sidebar.render("=== Drone 1 (ROSSO) ===", True, RED)
@@ -812,7 +960,7 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     if stats.get('conflict_d1', False):
         text_conflict = font_sidebar.render("⚠ Conflict!", True, (200, 0, 0))
         screen.blit(text_conflict, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing + 8
+    y_offset += spacing + 3  # Ridotto da 8 a 3
 
     # Drone 2 info
     text_d2 = font_sidebar.render("=== Drone 2 (BLU) ===", True, BLUE_D2)
@@ -854,7 +1002,7 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     if stats.get('conflict_d2', False):
         text_conflict = font_sidebar.render("⚠ Conflict!", True, (200, 0, 0))
         screen.blit(text_conflict, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing + 10
+    y_offset += spacing + 5  # Ridotto da 10 a 5
 
     # Max probabilità e cella
     max_prob = belief_map.max()
@@ -864,7 +1012,7 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     y_offset += spacing
     text_max_cell = font_sidebar.render(f"Max Cell: {max_pos}", True, BLACK)
     screen.blit(text_max_cell, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing + 10
+    y_offset += spacing + 5  # Ridotto da 10 a 5
 
     # Barra probabilità massima con threshold
     bar_width = SIDEBAR_WIDTH - 40
@@ -873,8 +1021,8 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     thr_pos = (GRID_WIDTH + 20) + bar_width * 0.95
     pygame.draw.line(screen, GREEN, (thr_pos, y_offset - 3), (thr_pos, y_offset + 23), 2)
     text_thr = font_sidebar.render("Threshold 0.95", True, GREEN)
-    screen.blit(text_thr, (GRID_WIDTH + 20, y_offset + 25))
-    y_offset += 50
+    screen.blit(text_thr, (GRID_WIDTH + 20, y_offset + 22))
+    y_offset += 45  # Ridotto da 50 a 45
 
     # Controlli
     text_auto = font_sidebar.render("SPAZIO: Auto Mode", True, BLACK)
@@ -907,19 +1055,50 @@ def get_real_observation(drone_pos, target_pos, alpha, beta):
 def run_simulation(params):
     pygame.init()
 
-    # Setup schermo (uguale all'originale)
+    # Setup schermo con adattamento automatico alla risoluzione disponibile
     map_size = params['map_size']
-    cell_size = 60
+    
+    # Ottieni risoluzione schermo disponibile
+    display_info = pygame.display.Info()
+    available_width = display_info.current_w
+    available_height = display_info.current_h
+    
+    # Riserva spazio per sidebar e margini (ridotti per far stare tutto nello schermo)
     sidebar_w = 480
+    margin = 80  # Margine di sicurezza ridotto
+    
+    # Calcola dimensione finestra massima che sta nello schermo
+    max_window_w = available_width - margin
+    max_window_h = available_height - margin
+    
+    # Calcola dimensione massima celle in base allo spazio disponibile
+    max_cell_w = (max_window_w - sidebar_w) // map_size
+    max_cell_h = max_window_h // map_size
+    cell_size = min(max_cell_w, max_cell_h, 80)  # Max 80px per cella
+    cell_size = max(cell_size, 25)  # Min 25px per cella
+    
     GRID_WIDTH = map_size * cell_size
     screen_w = GRID_WIDTH + sidebar_w
-    min_height = 750
-    screen_h = max(map_size * cell_size, min_height)
+    screen_h = map_size * cell_size
+    
+    # Assicurati che la finestra non superi lo schermo disponibile
+    screen_w = min(screen_w, max_window_w)
+    screen_h = min(screen_h, max_window_h)
+    
+    # Log informazioni visualizzazione
+    print(f"\n{'='*30}")
+    print(f"Risoluzione schermo: {available_width}x{available_height}")
+    print(f"Dimensione mappa: {map_size}x{map_size}")
+    print(f"Dimensione celle: {cell_size}px")
+    print(f"Finestra creata: {screen_w}x{screen_h}px")
+    print(f"={'='*30}\n")
 
     screen = pygame.display.set_mode((screen_w, screen_h))
     pygame.display.set_caption("Multi-Drone POMCP Decentralized")
 
-    font_cell = pygame.font.SysFont(None, 18)
+    # Font adattati alla dimensione delle celle
+    font_cell_size = max(10, min(18, cell_size // 3))
+    font_cell = pygame.font.SysFont(None, font_cell_size)
     font_sidebar = pygame.font.SysFont(None, 20)
 
     # 1. ISTANZIAZIONE ENTITÀ SEPARATE
@@ -1022,7 +1201,7 @@ def run_simulation(params):
 
                 # TERMINAZIONE (Threshold Check sulla belief del D1)
                 if d1.belief_map.max() >= 0.95:
-                    print("\n🎯 TARGET TROVATO! (probabilità > 95%)")
+                    print("\n TARGET TROVATO! (probabilità > 95%)")
                     auto_mode = False
                 
                 force_redraw = True
