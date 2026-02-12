@@ -48,9 +48,24 @@ def get_user_parameters():
             except ValueError:
                 print("Errore: formato non valido. Usa 'riga,colonna'")
 
-    #Input Posizione Drone e Target
-    d1_pos = _get_coord("Drone 1 (ROSSO)")
-    d2_pos = _get_coord("Drone 2 (BLU)")
+    # Input Numero Droni
+    print("\n--- Configurazione Droni ---")
+    while True:
+        try:
+            num_drones = int(input("Quanti droni vuoi utilizzare? (consigliato 2-6): "))
+            if num_drones > 0:
+                break
+            print("Il numero di droni deve essere maggiore di 0")
+        except ValueError:
+            print("Inserisci un numero valido.")
+    
+    # Input Posizioni Droni
+    drone_positions = []
+    for i in range(num_drones):
+        pos = _get_coord(f"Drone {i+1}")
+        drone_positions.append(pos)
+    
+    # Input Posizione Target
     target_pos = _get_coord("Target Reale")
     
     #Scelta della distribuzione iniziale sulla mappa
@@ -133,8 +148,8 @@ def get_user_parameters():
         'discount_factor': cfg['discount_factor'],
         'exploration_const': cfg['exploration_const'],
         'reward_alpha': cfg['reward_alpha'],
-        'd1_pos': d1_pos,
-        'd2_pos': d2_pos,
+        'num_drones': num_drones,
+        'drone_positions': drone_positions,
         'target_pos': target_pos,
         'map_config': map_config,
         'obstacles': obstacles
@@ -333,7 +348,7 @@ class POMCPSolver:
         self.dist_lookup = precompute_all_pairs_distances(self.map_size, self.obstacle_map)
 
     # Funzione di ricerca POMCP: costruiamo albero + restituzione azione migliore finale
-    def search(self, current_belief_map, drone_position, partner_position=None):
+    def search(self, current_belief_map, drone_position, partner_positions=None):
         
         # Creazione del nodo radice con la belief map attuale
         root = POMCPNode(belief_map=current_belief_map)
@@ -353,14 +368,14 @@ class POMCPSolver:
             state = (sampled_target_pos, drone_position)
             
             # Avvio della simulazione ricorsiva 
-            self.simulate(state, root, 0, partner_position=partner_position)
+            self.simulate(state, root, 0, partner_positions=partner_positions)
         
         # Selezione delle top 2 azioni migliori
         best_action, best_q, second_action, second_q = self._select_top_two_actions(root)
         return best_action, best_q, second_action, second_q
 
     # Singola simulazione POMCP: fatta in maniera ricorsiva per scendere in profondità
-    def simulate(self, state, node, depth, visited_cells=None, partner_position=None): 
+    def simulate(self, state, node, depth, visited_cells=None, partner_positions=None): 
         
         # Inizializzazione del set alla radice (COPIA per evitare condivisione)
         if visited_cells is None:
@@ -382,7 +397,7 @@ class POMCPSolver:
             # Se il nodo non ha figli, generiamo le azioni possibili
             # FASE 2: Al root level, escludiamo posizione partner
             is_root = (node.parent is None)
-            self.expand(node, state, partner_position if is_root else None)
+            self.expand(node, state, partner_positions if is_root else None)
             # Se dopo l'espansione non ci sono azioni valide (es. droni bloccati), ritorniamo penalty
             if not node.action_counts:
                 return -100.0 # Penalty per stallo/vicolo cieco
@@ -415,7 +430,7 @@ class POMCPSolver:
         if terminal:
             future_reward = 0.0
         else:
-            future_reward = self.simulate(next_state, child_node, depth + 1, visited_cells, partner_position=None)
+            future_reward = self.simulate(next_state, child_node, depth + 1, visited_cells, partner_positions=None)
         q_value = reward + self.gamma * future_reward
 
         # Backpropagation: aggiorniamo N(b), N(b,a) e Q(b,a)
@@ -434,12 +449,21 @@ class POMCPSolver:
         return q_value
 
     # Espansione nodo con combinazione azioni valide
-    def expand(self, node, state, partner_position=None):
+    def expand(self, node, state, partner_positions=None):
         
         # Estrazione posizione attuale del drone dallo stato
         _, drone_pos = state
         
         map_size = self.map_size  # Dimensione della griglia
+        
+        # Normalizza partner_positions in lista
+        if partner_positions is None:
+            partner_list = []
+        elif isinstance(partner_positions, list):
+            partner_list = partner_positions
+        else:
+            # Singola posizione: convertila in lista
+            partner_list = [partner_positions]
 
         for action in MOVES_DELTA.keys():
 
@@ -454,8 +478,8 @@ class POMCPSolver:
             if self.obstacle_map[next_pos[0], next_pos[1]] == 1:
                 continue
 
-            # FASE 2: Escludiamo posizione partner solo al root
-            if partner_position is not None and next_pos == partner_position:
+            # VIETARE celle occupate da partner (solo al root)
+            if partner_list and next_pos in partner_list:
                 continue
 
             if action not in node.action_counts:
@@ -650,7 +674,7 @@ class POMCPSolver:
 # Worker function per POMCP parallelo
 def worker_pomcp_task(args):
     """Worker per eseguire POMCP in modo parallelo"""
-    params, belief_map, my_pos, partner_pos = args
+    params, belief_map, my_pos, partner_positions = args
     
     # Creazione mappa ostacoli
     obstacle_map = initialize_obstacle_map(params) if 'obstacles' in params else np.zeros((params['map_size'], params['map_size']), dtype=int)
@@ -670,7 +694,7 @@ def worker_pomcp_task(args):
         obstacle_map=obstacle_map
     )
     
-    best_action, best_q, second_action, second_q = solver.search(belief_map, my_pos, partner_pos)
+    best_action, best_q, second_action, second_q = solver.search(belief_map, my_pos, partner_positions)
     
     return {
         'best_action': best_action,
@@ -716,12 +740,13 @@ class DroneAgent:
         self.planned_result = None   
         self.final_action = None     
 
-    def get_planning_args(self, partner_last_known_pos):
+    def get_planning_args(self, partner_positions):
         """
         PREPARA I DATI per il planner parallelo.
+        partner_positions: lista delle posizioni degli altri droni (può essere una lista o singola posizione per compatibilità)
         Restituisce una tupla contenente una COPIA della belief map.
         """
-        return (self.params, self.belief_map.copy(), self.pos, partner_last_known_pos)
+        return (self.params, self.belief_map.copy(), self.pos, partner_positions)
 
     def set_planning_result(self, result):
         """Riceve il risultato dal worker multiprocessing"""
@@ -750,61 +775,90 @@ class DroneAgent:
             'second_q': self.planned_result['second_q']
         }
 
-    def resolve_conflict_locally(self, other_packet):
+    def resolve_conflict_locally(self, other_packets):
         """
-        Riceve l'intenzione dell'altro e decide deterministicamente chi passa.
-        Non modifica l'altro drone, solo se stesso.
+        Riceve le intenzioni di tutti gli altri droni e decide l'azione da eseguire.
+        
+        Logica:
+        1. Prova best_action
+        2. Se c'è conflitto (stessa cella o swap) con un altro drone:
+           - Chi ha Q-value maggiore vince (esegue best_action)
+           - Chi ha Q-value minore perde (prova second_action)
+        3. Se anche second_action ha conflitti -> Stay
+        
+        Args:
+            other_packets: lista di pacchetti degli altri droni
+        
+        Returns:
+            bool: True se ha dovuto cambiare dalla best_action
         """
         # Safety check
         if self.planned_result is None:
             self.final_action = 'Stay'
             return False
         
-        # Calcolo mia prossima posizione
-        my_act = self.planned_result['best_action']
-        d = MOVES_DELTA[my_act]
-        my_next = (self.pos[0] + d[0], self.pos[1] + d[1])
-
-        # Calcolo prossima posizione dell'altro (basato sul suo pacchetto)
-        other_act = other_packet['best_action']
-        d2 = MOVES_DELTA[other_act]
-        other_next = (other_packet['pos'][0] + d2[0], other_packet['pos'][1] + d2[1])
-
-        # Check Conflitti
-        collision = (my_next == other_next)
-        swap = (my_next == other_packet['pos'] and other_next == self.pos)
-
-        must_yield = False
+        # Prova BEST ACTION
+        my_best_act = self.planned_result['best_action']
+        my_best_q = self.planned_result['best_q']
+        delta = MOVES_DELTA[my_best_act]
+        my_next = (self.pos[0] + delta[0], self.pos[1] + delta[1])
         
-        if collision or swap:
-            # Regola 1: Chi ha Q-value più alto vince (è più convinto/ha più info)
-            if other_packet['best_q'] > self.planned_result['best_q']:
-                must_yield = True
+        # Check conflitti con tutti gli altri droni
+        has_conflict_best = False
+        for other_pkt in other_packets:
+            other_act = other_pkt['best_action']
+            other_q = other_pkt['best_q']
+            other_delta = MOVES_DELTA[other_act]
+            other_next = (other_pkt['pos'][0] + other_delta[0], other_pkt['pos'][1] + other_delta[1])
             
-            # Regola 2: Tie-breaker deterministico su ID (per evitare stalli se Q è uguale)
-            elif other_packet['best_q'] == self.planned_result['best_q']:
-                if other_packet['id'] < self.id:
-                    must_yield = True
-        
-        # Se perdo il conflitto, uso la mia seconda azione migliore
-        if must_yield:
-            second_act = self.planned_result['second_action']
-            # Validazione: la seconda azione deve essere valida
-            d_second = MOVES_DELTA.get(second_act, (0, 0))
-            second_next = (self.pos[0] + d_second[0], self.pos[1] + d_second[1])
-            map_size = self.params['map_size']
+            # Conflitto: stessa cella
+            collision = (my_next == other_next)
+            # Swap: scambio posizioni
+            swap = (my_next == other_pkt['pos'] and other_next == self.pos)
             
-            # Controllo se la seconda azione è valida
-            if (0 <= second_next[0] < map_size and 0 <= second_next[1] < map_size):
-                self.final_action = second_act
-            else:
-                # Fallback: se anche la seconda è invalida, rimani fermo
-                self.final_action = 'Stay'
-                print(f"[WARNING] Drone {self.id}: second_action invalida, uso Stay")
-        else:
-            self.final_action = my_act
+            if collision or swap:
+                # Chi ha Q più alto vince, a parità ID minore vince
+                if other_q > my_best_q or (other_q == my_best_q and other_pkt['id'] < self.id):
+                    has_conflict_best = True
+                    break
         
-        return must_yield # Ritorna True se ho ceduto il passo
+        # Se best_action non ha conflitti, usala
+        if not has_conflict_best:
+            self.final_action = my_best_act
+            return False  # Non ho cambiato
+        
+        # Prova SECOND ACTION
+        my_second_act = self.planned_result['second_action']
+        my_second_q = self.planned_result['second_q']
+        delta2 = MOVES_DELTA[my_second_act]
+        my_next2 = (self.pos[0] + delta2[0], self.pos[1] + delta2[1])
+        
+        # Check conflitti per second_action
+        has_conflict_second = False
+        for other_pkt in other_packets:
+            other_act = other_pkt['best_action']
+            other_q = other_pkt['best_q']
+            other_delta = MOVES_DELTA[other_act]
+            other_next = (other_pkt['pos'][0] + other_delta[0], other_pkt['pos'][1] + other_delta[1])
+            
+            collision = (my_next2 == other_next)
+            swap = (my_next2 == other_pkt['pos'] and other_next == self.pos)
+            
+            if collision or swap:
+                # Confronto second_q con other best_q
+                if other_q > my_second_q or (other_q == my_second_q and other_pkt['id'] < self.id):
+                    has_conflict_second = True
+                    break
+        
+        # Se second_action non ha conflitti, usala
+        if not has_conflict_second:
+            self.final_action = my_second_act
+            return True  # Ho cambiato dalla best
+        
+        # Se anche second_action ha conflitti -> Stay
+        self.final_action = 'Stay'
+        print(f"[INFO] Drone {self.id}: conflitti su best e second action, uso Stay")
+        return True  # Ho cambiato
 
     def execute_move(self):
         """Aggiorna la propria posizione fisica"""
@@ -831,10 +885,11 @@ class DroneAgent:
         self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, self.pos, obs_val)
         return (self.pos, obs_val)
 
-    def receive_remote_observation(self, data_packet):
-        """Riceve pacchetto (pos, obs) dall'altro drone e aggiorna la mappa"""
-        pos, obs = data_packet
-        self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, pos, obs)
+    def receive_remote_observation(self, data_packets):
+        """Riceve lista di pacchetti (pos, obs) dagli altri droni e aggiorna la mappa"""
+        for data_packet in data_packets:
+            pos, obs = data_packet
+            self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, pos, obs)
 
 
 # =============================================================================
@@ -880,12 +935,29 @@ def draw_static_background(surface, p_map, font_cell, params):
                 text = font_cell.render(f"{prob * 100:.3f}%", True, BLACK)
                 surface.blit(text, (c * CELL_SIZE + 5, r * CELL_SIZE + 5))
 
-# Funzioni per disegnare elementi dinamici: droni, target e barra laterale (2 droni)
-def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_sidebar, GRID_WIDTH, CELL_SIZE, stats, SIDEBAR_WIDTH):
+# Palette di colori per droni multipli
+DRONE_COLORS = [
+    (255, 0, 0),      # ROSSO
+    (0, 0, 200),      # BLU
+    (0, 180, 0),      # VERDE
+    (255, 140, 0),    # ARANCIONE
+    (128, 0, 128),    # VIOLA
+    (255, 192, 203),  # ROSA
+    (165, 42, 42),    # MARRONE
+    (0, 255, 255),    # CIANO
+    (255, 255, 0),    # GIALLO
+    (128, 128, 128),  # GRIGIO SCURO
+]
+
+def get_drone_color(drone_id):
+    """Restituisce un colore unico per ogni drone (ciclico se > 10 droni)"""
+    return DRONE_COLORS[(drone_id - 1) % len(DRONE_COLORS)]
+
+# Funzioni per disegnare elementi dinamici: droni, target e barra laterale (N droni)
+def draw_elements(screen, belief_map, drone_agents, target_pos, params, font_sidebar, GRID_WIDTH, CELL_SIZE, stats, SIDEBAR_WIDTH):
     BLACK = (0, 0, 0)
     RED = (255, 0, 0)
-    BLUE_D2 = (0, 0, 200)
-    GREEN = (0, 200, 0)
+    GREEN = (0, 200, 0)  # Per threshold bar
     GRAY = (200, 200, 200)
     WHITE = (255, 255, 255)
     BLUE = (0, 0, 255)  # Usato per la barra di progresso
@@ -897,15 +969,12 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
     pygame.draw.line(screen, BLACK, target_rect.topleft, target_rect.bottomright, 3)
     pygame.draw.line(screen, BLACK, target_rect.topright, target_rect.bottomleft, 3)
 
-    # Drone 1 (cerchio ROSSO)
-    d1r, d1c = d1_pos
-    center1 = (d1c * CELL_SIZE + CELL_SIZE // 2, d1r * CELL_SIZE + CELL_SIZE // 2)
-    pygame.draw.circle(screen, RED, center1, CELL_SIZE // 3, 4)
-
-    # Drone 2 (cerchio BLU)
-    d2r, d2c = d2_pos
-    center2 = (d2c * CELL_SIZE + CELL_SIZE // 2, d2r * CELL_SIZE + CELL_SIZE // 2)
-    pygame.draw.circle(screen, BLUE_D2, center2, CELL_SIZE // 3 - 4, 4)
+    # Disegna tutti i droni dinamicamente
+    for drone in drone_agents:
+        dr, dc = drone.pos
+        center = (dc * CELL_SIZE + CELL_SIZE // 2, dr * CELL_SIZE + CELL_SIZE // 2)
+        color = get_drone_color(drone.id)
+        pygame.draw.circle(screen, color, center, CELL_SIZE // 3, 4)
 
     # Sidebar - estesa per tutta l'altezza della finestra
     screen_height = screen.get_height()
@@ -914,95 +983,59 @@ def draw_elements(screen, belief_map, d1_pos, d2_pos, target_pos, params, font_s
 
     # Statistiche
     y_offset = 10
-    spacing = 18  # Ridotto da 22 a 18
+    spacing = 16  # Spacing compatto per supportare più droni
 
     text_step = font_sidebar.render(f"Step: {stats['step']}", True, BLACK)
     screen.blit(text_step, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing + 5  # Ridotto da 8 a 5
+    y_offset += spacing + 5
 
-    # Drone 1 info
-    text_d1 = font_sidebar.render("=== Drone 1 (ROSSO) ===", True, RED)
-    screen.blit(text_d1, (GRID_WIDTH + 10, y_offset))
-    y_offset += spacing
+    # Disegna info per tutti i droni dinamicamente
+    for drone in drone_agents:
+        drone_id = drone.id
+        color = get_drone_color(drone_id)
+        
+        # Header drone
+        text_header = font_sidebar.render(f"=== Drone {drone_id} ===", True, color)
+        screen.blit(text_header, (GRID_WIDTH + 10, y_offset))
+        y_offset += spacing
 
-    text_d1_pos = font_sidebar.render(f"Pos: {d1_pos}", True, BLACK)
-    screen.blit(text_d1_pos, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
+        # Simulations
+        sims = stats['drones'][drone_id].get('visits', 0)
+        text_sims = font_sidebar.render(f"Sims: {sims}", True, BLACK)
+        screen.blit(text_sims, (GRID_WIDTH + 20, y_offset))
+        y_offset += spacing
 
-    text_d1_obs = font_sidebar.render(f"Obs: {stats.get('d1_obs', '-')}", True, BLACK)
-    screen.blit(text_d1_obs, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
+        # Tree depth
+        depth = stats['drones'][drone_id].get('depth', 0)
+        text_depth = font_sidebar.render(f"Depth: {depth}", True, BLACK)
+        screen.blit(text_depth, (GRID_WIDTH + 20, y_offset))
+        y_offset += spacing
 
-    text_d1_depth = font_sidebar.render(f"Tree Depth: {stats.get('d1_depth', 0)}", True, BLACK)
-    screen.blit(text_d1_depth, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
+        # Best action
+        best_act = stats['drones'][drone_id].get('best', '-')
+        best_q = stats['drones'][drone_id].get('best_q', 0)
+        text_best = font_sidebar.render(f"Best: {best_act} Q={best_q:.3f}", True, BLACK)
+        screen.blit(text_best, (GRID_WIDTH + 20, y_offset))
+        y_offset += spacing
 
-    text_d1_sims = font_sidebar.render(f"Simulations: {stats.get('d1_visits', 0)}", True, BLACK)
-    screen.blit(text_d1_sims, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
+        # Second action
+        second_act = stats['drones'][drone_id].get('second', '-')
+        second_q = stats['drones'][drone_id].get('second_q', 0)
+        text_second = font_sidebar.render(f"2nd: {second_act} Q={second_q:.3f}", True, BLACK)
+        screen.blit(text_second, (GRID_WIDTH + 20, y_offset))
+        y_offset += spacing
 
-    text_d1_nodes = font_sidebar.render(f"Nodes Created: {stats.get('d1_nodes', 0)}", True, BLACK)
-    screen.blit(text_d1_nodes, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
+        # Final action (executed after conflict resolution)
+        final_act = stats['drones'][drone_id].get('final', '-')
+        text_final = font_sidebar.render(f"Final: {final_act}", True, BLACK)
+        screen.blit(text_final, (GRID_WIDTH + 20, y_offset))
+        y_offset += spacing
 
-    text_d1_best = font_sidebar.render(f"Best: {stats.get('d1_best', '-')} Q={stats.get('d1_best_q', 0):.4f}", True, BLACK)
-    screen.blit(text_d1_best, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d1_2nd = font_sidebar.render(f"2nd: {stats.get('d1_2nd', '-')} Q={stats.get('d1_2nd_q', 0):.4f}", True, BLACK)
-    screen.blit(text_d1_2nd, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d1_final = font_sidebar.render(f"Final Action: {stats.get('d1_final', '-')}", True, BLACK)
-    screen.blit(text_d1_final, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    if stats.get('conflict_d1', False):
-        text_conflict = font_sidebar.render("⚠ Conflict!", True, (200, 0, 0))
-        screen.blit(text_conflict, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing + 3  # Ridotto da 8 a 3
-
-    # Drone 2 info
-    text_d2 = font_sidebar.render("=== Drone 2 (BLU) ===", True, BLUE_D2)
-    screen.blit(text_d2, (GRID_WIDTH + 10, y_offset))
-    y_offset += spacing
-
-    text_d2_pos = font_sidebar.render(f"Pos: {d2_pos}", True, BLACK)
-    screen.blit(text_d2_pos, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d2_obs = font_sidebar.render(f"Obs: {stats.get('d2_obs', '-')}", True, BLACK)
-    screen.blit(text_d2_obs, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d2_depth = font_sidebar.render(f"Tree Depth: {stats.get('d2_depth', 0)}", True, BLACK)
-    screen.blit(text_d2_depth, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d2_sims = font_sidebar.render(f"Simulations: {stats.get('d2_visits', 0)}", True, BLACK)
-    screen.blit(text_d2_sims, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d2_nodes = font_sidebar.render(f"Nodes Created: {stats.get('d2_nodes', 0)}", True, BLACK)
-    screen.blit(text_d2_nodes, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d2_best = font_sidebar.render(f"Best: {stats.get('d2_best', '-')} Q={stats.get('d2_best_q', 0):.4f}", True, BLACK)
-    screen.blit(text_d2_best, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d2_2nd = font_sidebar.render(f"2nd: {stats.get('d2_2nd', '-')} Q={stats.get('d2_2nd_q', 0):.4f}", True, BLACK)
-    screen.blit(text_d2_2nd, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    text_d2_final = font_sidebar.render(f"Final Action: {stats.get('d2_final', '-')}", True, BLACK)
-    screen.blit(text_d2_final, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing
-
-    if stats.get('conflict_d2', False):
-        text_conflict = font_sidebar.render("⚠ Conflict!", True, (200, 0, 0))
-        screen.blit(text_conflict, (GRID_WIDTH + 20, y_offset))
-    y_offset += spacing + 5  # Ridotto da 10 a 5
+        # Conflict indicator
+        if stats['drones'][drone_id].get('conflict', False):
+            text_conflict = font_sidebar.render("⚠ Conflict!", True, (200, 0, 0))
+            screen.blit(text_conflict, (GRID_WIDTH + 20, y_offset))
+        y_offset += spacing + 2
 
     # Max probabilità e cella
     max_prob = belief_map.max()
@@ -1057,6 +1090,7 @@ def run_simulation(params):
 
     # Setup schermo con adattamento automatico alla risoluzione disponibile
     map_size = params['map_size']
+    num_drones = params['num_drones']
     
     # Ottieni risoluzione schermo disponibile
     display_info = pygame.display.Info()
@@ -1102,13 +1136,15 @@ def run_simulation(params):
     font_sidebar = pygame.font.SysFont(None, 20)
 
     # 1. ISTANZIAZIONE ENTITÀ SEPARATE
-    # Invece di variabili sciolte, creiamo due AGENTI
-    d1 = DroneAgent(1, params['d1_pos'], params)
-    d2 = DroneAgent(2, params['d2_pos'], params)
+    # Creiamo N agenti droni dinamicamente
+    drones = []
+    for i in range(num_drones):
+        drone = DroneAgent(i + 1, params['drone_positions'][i], params)
+        drones.append(drone)
     target_pos = params['target_pos']
     
-    # Setup multiprocessing
-    pool = multiprocessing.Pool(processes=2)
+    # Setup multiprocessing per N droni
+    pool = multiprocessing.Pool(processes=num_drones)
     clock = pygame.time.Clock()
     
     running = True
@@ -1123,17 +1159,21 @@ def run_simulation(params):
     frames = []
     capture_frame = False  # Flag per catturare frame dopo rendering normale
 
-    # UI Stats (Struttura dati per la grafica originale)
+    # UI Stats (Struttura dati dinamica per N droni)
     ui_stats = {
         'step': 0,
-        'd1_obs': '-', 'd2_obs': '-',
-        'd1_depth': 0, 'd2_depth': 0,
-        'd1_visits': 0, 'd2_visits': 0,
-        'd1_nodes': 0, 'd2_nodes': 0,
-        'd1_best': '-', 'd1_best_q': 0, 'd1_2nd': '-', 'd1_2nd_q': 0,
-        'd2_best': '-', 'd2_best_q': 0, 'd2_2nd': '-', 'd2_2nd_q': 0,
-        'd1_final': '-', 'd2_final': '-',
-        'conflict_d1': False, 'conflict_d2': False
+        'drones': {drone.id: {
+            'obs': '-',
+            'depth': 0,
+            'visits': 0,
+            'nodes': 0,
+            'best': '-',
+            'best_q': 0,
+            'second': '-',
+            'second_q': 0,
+            'final': '-',
+            'conflict': False
+        } for drone in drones}
     }
 
     try:
@@ -1144,63 +1184,78 @@ def run_simulation(params):
                     step_counter += 1
                     print(f"\n--- STEP {step_counter} ---")
 
-                # FASE 1: PIANIFICAZIONE PARALLELA (Agenti autonomi)
-                # Ognuno prepara il suo pacchetto e lo invia al pool di calcolo
-                task1 = d1.get_planning_args(d2.pos)
-                task2 = d2.get_planning_args(d1.pos)
-                results = pool.map(worker_pomcp_task, [task1, task2])
+                # FASE 1: PIANIFICAZIONE PARALLELA (Agenti autonomi - N droni)
+                # Ogni drone prepara il suo pacchetto con le posizioni degli altri droni
+                tasks = []
+                for drone in drones:
+                    # Ottieni posizioni di tutti gli altri droni (escluso se stesso)
+                    partner_positions = [other.pos for other in drones if other.id != drone.id]
+                    task = drone.get_planning_args(partner_positions)
+                    tasks.append(task)
+                
+                # Esegui POMCP in parallelo per tutti i droni
+                results = pool.map(worker_pomcp_task, tasks)
                 
                 # I droni ricevono i risultati
-                d1.set_planning_result(results[0])
-                d2.set_planning_result(results[1])
+                for i, drone in enumerate(drones):
+                    drone.set_planning_result(results[i])
 
                 # FASE 2: SCAMBIO INTENZIONI & CONFLITTI
-                # Simula scambio messaggi: D1 invia intenzione a D2, e viceversa
-                pkt1 = d1.create_intention_packet()
-                pkt2 = d2.create_intention_packet()
+                # Simula scambio messaggi: ogni drone crea il suo pacchetto
+                intention_packets = [drone.create_intention_packet() for drone in drones]
                 
-                # Risoluzione autonoma: ognuno decide per sé
-                c1 = d1.resolve_conflict_locally(pkt2)
-                c2 = d2.resolve_conflict_locally(pkt1)
+                # Risoluzione autonoma: ognuno riceve i pacchetti degli altri
+                conflicts = {}
+                for drone in drones:
+                    # Ottieni pacchetti di tutti gli altri droni
+                    other_packets = [pkt for pkt in intention_packets if pkt['id'] != drone.id]
+                    conflict = drone.resolve_conflict_locally(other_packets)
+                    conflicts[drone.id] = conflict
 
                 # FASE 3: MOVIMENTO
-                d1.execute_move()
-                d2.execute_move()
+                for drone in drones:
+                    drone.execute_move()
 
                 # FASE 4: SENSING (Simulazione Fisica)
-                obs1 = get_real_observation(d1.pos, target_pos, params['real_alpha'], params['real_beta'])
-                obs2 = get_real_observation(d2.pos, target_pos, params['real_alpha'], params['real_beta'])
+                observations = {}
+                for drone in drones:
+                    obs = get_real_observation(drone.pos, target_pos, params['real_alpha'], params['real_beta'])
+                    observations[drone.id] = obs
                 
                 # FASE 5: COMUNICAZIONE DATI
-                # Ognuno processa il proprio dato e crea un pacchetto per l'altro
-                data_pkt_1 = d1.process_local_observation(obs1)
-                data_pkt_2 = d2.process_local_observation(obs2)
+                # Ognuno processa il proprio dato e crea un pacchetto
+                data_packets = {}
+                for drone in drones:
+                    data_pkt = drone.process_local_observation(observations[drone.id])
+                    data_packets[drone.id] = data_pkt
                 
-                # Ognuno riceve il pacchetto dell'altro
-                d1.receive_remote_observation(data_pkt_2)
-                d2.receive_remote_observation(data_pkt_1)
+                # Ognuno riceve i pacchetti degli altri
+                for drone in drones:
+                    other_data = [data_packets[other_id] for other_id in data_packets if other_id != drone.id]
+                    drone.receive_remote_observation(other_data)
 
                 # AGGIORNAMENTO DATI PER UI
-                # Mappiamo i dati interni degli agenti nel dizionario stats originale
-                res1, res2 = d1.planned_result, d2.planned_result
-                ui_stats.update({
-                    'step': step_counter,
-                    'd1_obs': obs1, 'd2_obs': obs2,
-                    'd1_depth': res1['depth'], 'd2_depth': res2['depth'],
-                    'd1_visits': res1['visits'], 'd2_visits': res2['visits'],
-                    'd1_nodes': res1['nodes_created'], 'd2_nodes': res2['nodes_created'],
-                    'd1_best': res1['best_action'], 'd1_best_q': res1['best_q'],
-                    'd1_2nd': res1['second_action'], 'd1_2nd_q': res1['second_q'],
-                    'd2_best': res2['best_action'], 'd2_best_q': res2['best_q'],
-                    'd2_2nd': res2['second_action'], 'd2_2nd_q': res2['second_q'],
-                    'd1_final': d1.final_action, 'd2_final': d2.final_action,
-                    'conflict_d1': c1, 'conflict_d2': c2
-                })
+                # Mappiamo i dati interni degli agenti nel dizionario stats
+                ui_stats['step'] = step_counter
+                for drone in drones:
+                    result = drone.planned_result
+                    ui_stats['drones'][drone.id].update({
+                        'obs': observations[drone.id],
+                        'depth': result['depth'],
+                        'visits': result['visits'],
+                        'nodes': result['nodes_created'],
+                        'best': result['best_action'],
+                        'best_q': result['best_q'],
+                        'second': result['second_action'],
+                        'second_q': result['second_q'],
+                        'final': drone.final_action,
+                        'conflict': conflicts[drone.id]
+                    })
 
                 capture_frame = is_recording  # Segna che serve catturare questo frame
 
-                # TERMINAZIONE (Threshold Check sulla belief del D1)
-                if d1.belief_map.max() >= 0.95:
+                # TERMINAZIONE (Threshold Check sulla belief del primo drone)
+                if drones[0].belief_map.max() >= 0.95:
                     print("\n TARGET TROVATO! (probabilità > 95%)")
                     auto_mode = False
                 
@@ -1231,17 +1286,17 @@ def run_simulation(params):
                             imageio.mimsave(filename, frames, fps=30, loop=0)
                             print(f"✅ GIF salvata: {filename}"); frames = []
 
-            # DISEGNO (IDENTICO ALL'ORIGINALE)
+            # DISEGNO
             if force_redraw:
-                # Usiamo la mappa di D1 per il background (in un sistema ideale D1 e D2 convergono)
-                draw_static_background(background_surface, d1.belief_map, font_cell, params)
+                # Usiamo la mappa del primo drone per il background
+                draw_static_background(background_surface, drones[0].belief_map, font_cell, params)
                 force_redraw = False
                 
             screen.fill((255, 255, 255))
             screen.blit(background_surface, (0, 0))
-            # Disegnamo gli elementi prendendo le posizioni dagli agenti
+            # Disegnamo gli elementi prendendo le posizioni dagli agenti (N droni)
             draw_elements(
-                screen, d1.belief_map, d1.pos, d2.pos, target_pos, params,
+                screen, drones[0].belief_map, drones, target_pos, params,
                 font_sidebar, GRID_WIDTH, cell_size, ui_stats, sidebar_w
             )
             
