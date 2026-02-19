@@ -13,7 +13,7 @@ from datetime import datetime
 DEFAULT_MAP_SIZE = 15  # Dimensione lato mappa quadrata
 DEFAULT_SENSOR_ALPHA = 0.01  # Imposta qui il falso positivo del sensore
 DEFAULT_SENSOR_BETA = 0.01   # Imposta qui il falso negativo del sensore
-LOCAL_SUM_THRESHOLD = 0.000001  #minimo della somma locale delle probabilitÃ , se non rispettata si segue il massimo globale
+
 
 
 # --- 1. Funzioni di Configurazione e Inizializzazione ---
@@ -542,28 +542,13 @@ def check_decision_thresholds(p_map, params):
 
 #---3. Logica strategia di movimento Greedy coerente ---
 
-def get_next_greedy_move(p_map, drone_pos, grid_size, obstacle_map=None, local_sum_threshold=LOCAL_SUM_THRESHOLD, blocked_cells=None):
-    """Valuta N/S/O/E/Stay in base alle probabilitÃ  e, se necessario, segue il massimo globale."""
+def get_next_greedy_move(p_map, drone_pos, grid_size, obstacle_map=None, blocked_cells=None):
+    """Valuta N/S/O/E/Stay in base alle probabilitÃ  delle celle adiacenti e sceglie il massimo locale."""
 
     if blocked_cells is None:
         blocked_cells = set()
     else:
         blocked_cells = set(blocked_cells)
-
-    def _step_towards(start, target):
-        if start == target:
-            return list(start)
-        dr = target[0] - start[0]
-        dc = target[1] - start[1]
-        move = [start[0], start[1]]
-        if abs(dr) >= abs(dc) and dr != 0:
-            move[0] += int(np.sign(dr))
-        elif dc != 0:
-            move[1] += int(np.sign(dc))
-        return move
-
-    def _global_best_cell():
-        return tuple(np.unravel_index(np.argmax(p_map), p_map.shape))
 
     grid_w, grid_h = grid_size
     neighbors = [
@@ -585,25 +570,16 @@ def get_next_greedy_move(p_map, drone_pos, grid_size, obstacle_map=None, local_s
             continue
         candidates.append(((nr, nc), p_map[nr, nc]))
 
+    # Se ci sono celle valide, scegli quella con probabilitÃ  massima
     if candidates:
-        local_sum = sum(prob for _, prob in candidates)
-        if local_sum >= local_sum_threshold:
-            best_cell, _ = max(candidates, key=lambda item: item[1])
-            return list(best_cell)
-
-    fallback_cell = _global_best_cell()         
-    step = _step_towards(drone_pos, fallback_cell)
+        best_cell, _ = max(candidates, key=lambda item: item[1])
+        return list(best_cell)
     
-    # Check se lo step verso il fallback Ã¨ bloccato o Ã¨ un ostacolo
-    if tuple(step) in blocked_cells:
-        return list(drone_pos)
-    if obstacle_map is not None and obstacle_map[step[0], step[1]] == 1:
-        return list(drone_pos)
-    
-    return step
+    # Se non ci sono mosse valide, resta fermo
+    return list(drone_pos)
 
 
-def plan_multi_drone_moves(p_map, drone_positions, grid_size, obstacle_map=None, local_sum_threshold=LOCAL_SUM_THRESHOLD):
+def plan_multi_drone_moves(p_map, drone_positions, grid_size, obstacle_map=None):
     """Restituisce una lista di nuove posizioni evitando collisioni e swap, supportando N droni."""
     new_positions = []
     current_positions = [tuple(pos) for pos in drone_positions]
@@ -618,7 +594,6 @@ def plan_multi_drone_moves(p_map, drone_positions, grid_size, obstacle_map=None,
             pos,
             grid_size,
             obstacle_map=obstacle_map,
-            local_sum_threshold=local_sum_threshold,
             blocked_cells=blocked
         )
 
@@ -974,4 +949,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
