@@ -1,139 +1,412 @@
 #SPIEGAZIONE CODICE:
-#Mappa di probabilità con aggiornamento bayesiano, con possibilità di introdurre modello del sensore non ideale, credenza aggregata
-#diversa da 1, distribuzione uniforme o gaussiana, limite superiore o inferiore per capire se target c'è o no
-#è rimasta b_0 anche se non usata, per una futura implementazione con credenza totale diversa da 1
-#è possibile muovere anche manualmente i droni, oppure lasciare la modalità automatica con strategia greedy ad asta (anche con mosse in diagonale)
+#Mappa di probabilità con aggiornamento bayesiano, possibilità di introdurre modello del sensore non ideale,
+#distribuzione uniforme o gaussiana iniziale, e strategia di movimento ad Asta per più droni.
 
 import pygame
 import numpy as np
 from scipy.stats import multivariate_normal
 import sys
-import math
 import imageio
 from datetime import datetime
+
+# Parametri di default
+DEFAULT_MAP_SIZE = 15  # Dimensione lato mappa quadrata
+DEFAULT_SENSOR_ALPHA = 0.01  # Imposta qui il falso positivo del sensore
+DEFAULT_SENSOR_BETA = 0.01   # Imposta qui il falso negativo del sensore
 
 
 # --- 1. Funzioni di Configurazione e Inizializzazione ---
 
 def get_user_parameters():
-    print("--- Configurazione Nuova Simulazione ---")
-    alpha = None
-    beta = None
-    b0 = None
-
-    # Dimensione griglia per verifica input utente
-    grid_size = (10, 10)
-    grid_w, grid_h = grid_size
-
-    # Funzione che garantisce input intero valido entro range [lo, hi]
-    def ask_int_in_range(prompt: str, lo: int, hi: int) -> int:
-        while True:
-            try:                
-                v = int(input(f"{prompt} [{lo}-{hi}]: "))
-                if lo <= v <= hi:
-                    return v
-                print(f"Valore fuori range. Inserisci un intero tra {lo} e {hi}.")
-            except ValueError:          #Gestione errore input non intero
-                print("Valore non valido. Inserisci un intero.")
-
-    def ask_sigma_pair(prompt: str):
-        while True:
-            raw_value = input(f"{prompt} (formato sigma_x,sigma_y): ").strip()
-            try:
-                sx_str, sy_str = raw_value.split(',')
-                sx = float(sx_str.strip())
-                sy = float(sy_str.strip())
-                if sx > 0 and sy > 0:
-                    return sx, sy
-                print("Entrambe le deviazioni standard devono essere > 0.")
-            except ValueError:
-                print("Formato non valido. Usa due numeri come '2.0,1.5'.")
-
-    def ask_positive_int(prompt: str) -> int:
-        while True:
-            try:
-                v = int(input(f"{prompt} (>=1): "))
-                if v >= 1:
-                    return v
-                print("Inserisci un intero maggiore o uguale a 1.")
-            except ValueError:
-                print("Valore non valido. Inserisci un intero.")
-
-    def ask_coord_pair(prompt: str):
-        while True:
-            raw_value = input(f"{prompt} (formato x,y): ").strip()
-            try:
-                x_str, y_str = raw_value.split(',')
-                x = int(x_str.strip())
-                y = int(y_str.strip())
-                if 0 <= x < grid_w and 0 <= y < grid_h:
-                    return (x, y)
-                print(f"Coordinate fuori range. Usa valori tra 0 e {grid_w - 1} per X e 0 e {grid_h - 1} per Y.")
-            except ValueError:
-                print("Formato non valido. Inserisci due interi come 'x,y'.")
-
-    alpha = 0
-    beta = 0
-    b0 = 1
-
-    #Inserimento Posizione Droni Iniziali (inserimento obbligatorio sulla mappa)
-    print("\nPosiziona i DRONI iniziali (coordinate tra 0 e 9):")
-    drone_red = ask_coord_pair("  Drone ROSSO")
-
-    while True:
-        drone_green = ask_coord_pair("  Drone VERDE")
-        if drone_green != drone_red:
-            break
-        print("Posizione già occupata dal drone rosso. Scegli coordinate diverse per il drone verde.")
-
-    #Inserimento Posizione Target
-    print("\nPosiziona il VERO target:")
-    target_pos = ask_coord_pair("  Target")
+    """
+    Interfaccia grafica interattiva per configurare la missione.
+    L'utente clicca sulla griglia per selezionare coordinate, preme INVIO per confermare.
+    """
+    print("=== CONFIGURAZIONE MISSIONE DI RICERCA (GUI) - STRATEGIA AD ASTA ===")
     
-    #Scelta Distribuzione Probabilità Iniziale
-    print("\nScegli la distribuzione di probabilità iniziale:")
-    print(" 1) Uniforme")
-    print(" 2) Gaussiana singola")
-    print(" 3) Gaussiana multipla")
-    dist_choice = ask_int_in_range("Seleziona distribuzione", 1, 3)
-
-    dist_type_map = {
-        1: 'uniform',
-        2: 'gaussian_single',
-        3: 'gaussian_multi'
-    }
-    dist_type = dist_type_map[dist_choice]
-    dist_params = {}
-
-    if dist_type in ('gaussian_single', 'gaussian_multi'):
-        dist_params['peaks'] = []
-        num_peaks = 1 if dist_type == 'gaussian_single' else ask_positive_int("Quante gaussiane vuoi inserire")
-
-        for idx in range(num_peaks):
-            print(f"\nConfigura la gaussiana #{idx + 1}:")
-            mean = ask_coord_pair("  Centro (x,y)")
-            sigma_x, sigma_y = ask_sigma_pair("  Deviazioni standard")
-            cov_matrix = [[sigma_x ** 2, 0], [0, sigma_y ** 2]]
-            dist_params['peaks'].append({'mean': mean, 'cov': cov_matrix})
+    map_size = DEFAULT_MAP_SIZE
+    alpha = DEFAULT_SENSOR_ALPHA
+    beta = DEFAULT_SENSOR_BETA
+    print(f"Parametri: Map Size={map_size}x{map_size}, Alpha={alpha}, Beta={beta}")
     
-    #Return, restituisce i valori della funzione nel main
+    # Inizializza pygame
+    pygame.init()
+    
+    # Ottieni dimensioni dello schermo disponibile
+    display_info = pygame.display.Info()
+    screen_width = display_info.current_w
+    screen_height = display_info.current_h
+    
+    # Calcola dimensioni ottimali per adattarsi allo schermo
+    info_height = 150
+    available_width = screen_width - 100
+    available_height = screen_height - info_height - 150
+    
+    # Calcola cell_size in base allo spazio disponibile
+    max_cell_from_width = available_width // map_size
+    max_cell_from_height = available_height // map_size
+    cell_size = min(max_cell_from_width, max_cell_from_height, 40)
+    cell_size = max(cell_size, 20)
+    
+    # Calcola margini proporzionalmente
+    margin = max(30, min(50, (available_width - map_size * cell_size) // 2))
+    
+    # Dimensioni finali della finestra
+    window_width = map_size * cell_size + 2 * margin
+    window_height = map_size * cell_size + 2 * margin + info_height
+    
+    screen = pygame.display.set_mode((window_width, window_height))
+    pygame.display.set_caption("Configurazione Missione - Click per selezionare")
+    
+    # Colori
+    WHITE = (255, 255, 255)
+    BLACK = (0, 0, 0)
+    GRAY = (200, 200, 200)
+    LIGHT_GRAY = (240, 240, 240)
+    BLUE = (50, 100, 255)
+    RED = (255, 50, 50)
+    GREEN = (50, 255, 50)
+    YELLOW = (255, 200, 50)
+    PURPLE = (200, 50, 255)
+    
+    # Font adattivi
+    font_size_title = max(24, min(32, cell_size + 4))
+    font_size_info = max(18, min(24, cell_size - 4))
+    font_size_small = max(12, min(18, int(cell_size * 0.5)))
+    
+    font_title = pygame.font.Font(None, font_size_title)
+    font_info = pygame.font.Font(None, font_size_info)
+    font_small = pygame.font.Font(None, font_size_small)
+    
+    def draw_grid(selected_positions, phase_name, phase_color, context_items=None):
+        """Disegna la griglia con le posizioni selezionate e gli elementi contestuali"""
+        screen.fill(WHITE)
+        
+        if context_items is None:
+            context_items = {}
+        
+        # Titolo
+        title_text = font_title.render(f"FASE: {phase_name}", True, phase_color)
+        screen.blit(title_text, (margin, 10))
+        
+        # Istruzioni
+        info_text = font_info.render("Click sulla griglia per selezionare celle", True, BLACK)
+        help_text = font_small.render("Premi INVIO per confermare e passare alla fase successiva", True, GRAY)
+        screen.blit(info_text, (margin, 35))
+        screen.blit(help_text, (margin, 58))
+        
+        # Griglia
+        grid_offset_y = margin + info_height
+        for r in range(map_size):
+            for c in range(map_size):
+                x = margin + c * cell_size
+                y = grid_offset_y + r * cell_size
+                
+                # Determina il colore della cella e l'etichetta
+                cell_color = LIGHT_GRAY
+                label = f"{r},{c}"
+                text_color = BLACK
+                
+                # Controlla se è un drone già inserito
+                if 'drones' in context_items and (r, c) in context_items['drones']:
+                    cell_color = BLUE
+                    label = "D"
+                    text_color = WHITE
+                # Controlla se è il target già inserito
+                elif 'target' in context_items and (r, c) == context_items['target']:
+                    cell_color = RED
+                    label = "T"
+                    text_color = WHITE
+                # Controlla se è un picco gaussiano già inserito
+                elif 'peaks' in context_items and (r, c) in context_items['peaks']:
+                    cell_color = PURPLE
+                    label = "G"
+                    text_color = WHITE
+                # Controlla se è selezionato nella fase corrente
+                elif (r, c) in selected_positions:
+                    cell_color = phase_color
+                    label = f"{r},{c}"
+                    text_color = WHITE
+                
+                pygame.draw.rect(screen, cell_color, (x, y, cell_size, cell_size))
+                pygame.draw.rect(screen, GRAY, (x, y, cell_size, cell_size), 1)
+                
+                # Mostra coordinata o etichetta
+                coord_text = font_small.render(label, True, text_color)
+                text_rect = coord_text.get_rect(center=(x + cell_size//2, y + cell_size//2))
+                screen.blit(coord_text, text_rect)
+        
+        # Contatore selezioni
+        count_text = font_info.render(f"Selezionati: {len(selected_positions)}", True, BLACK)
+        screen.blit(count_text, (margin, window_height - 35))
+        
+        pygame.display.flip()
+    
+    def get_cell_from_mouse(mouse_pos):
+        """Converte posizione mouse in coordinate griglia"""
+        grid_offset_y = margin + info_height
+        x, y = mouse_pos
+        
+        if x < margin or y < grid_offset_y:
+            return None
+        
+        c = (x - margin) // cell_size
+        r = (y - grid_offset_y) // cell_size
+        
+        if 0 <= r < map_size and 0 <= c < map_size:
+            return (r, c)
+        return None
+    
+    def interactive_selection(phase_name, phase_color, allow_multiple=True, context_items=None):
+        """Modalità interattiva per selezionare celle"""
+        selected = []
+        running = True
+        
+        while running:
+            draw_grid(selected, phase_name, phase_color, context_items)
+            
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    exit()
+                
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    cell = get_cell_from_mouse(event.pos)
+                    if cell:
+                        if cell in selected:
+                            selected.remove(cell)  # Deseleziona se già selezionato
+                        else:
+                            if allow_multiple:
+                                selected.append(cell)
+                            else:
+                                selected = [cell]  # Solo una selezione
+                
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_RETURN:
+                        if len(selected) > 0:
+                            running = False
+                    elif event.key == pygame.K_ESCAPE:
+                        pygame.quit()
+                        exit()
+        
+        return selected
+    
+    # ========== FASE 1: SELEZIONE DRONI ==========
+    print("\n[1/5] Seleziona posizioni DRONI (click multipli + INVIO)")
+    drone_positions = interactive_selection("1. Posizioni DRONI", BLUE, allow_multiple=True)
+    num_drones = len(drone_positions)
+    print(f"✓ {num_drones} droni configurati")
+    
+    # ========== FASE 2: SELEZIONE TARGET ==========
+    print("\n[2/5] Seleziona posizione TARGET (1 click + INVIO)")
+    context_with_drones = {'drones': drone_positions}
+    target_list = interactive_selection("2. Posizione TARGET", RED, allow_multiple=False, context_items=context_with_drones)
+    target_pos = target_list[0]
+    print(f"✓ Target in posizione {target_pos}")
+    
+    # ========== FASE 3: SCELTA TIPO MAPPA ==========
+    print("\n[3/5] Scegli tipo di mappa belief iniziale")
+    map_config = {}
+    
+    # Finestra di scelta tipo mappa
+    screen.fill(WHITE)
+    title = font_title.render("Tipo di Belief Map Iniziale", True, BLACK)
+    screen.blit(title, (margin, margin))
+    
+    options = [
+        "1 - Uniforme (premi 1)",
+        "2 - Singola Gaussiana (premi 2)",
+        "3 - Multi-Gaussiana (premi 3)"
+    ]
+    
+    for i, opt in enumerate(options):
+        text = font_info.render(opt, True, BLACK)
+        screen.blit(text, (margin, margin + 50 + i * 30))
+    
+    pygame.display.flip()
+    
+    map_type = None
+    waiting = True
+    while waiting:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_1:
+                    map_type = 1
+                    waiting = False
+                elif event.key == pygame.K_2:
+                    map_type = 2
+                    waiting = False
+                elif event.key == pygame.K_3:
+                    map_type = 3
+                    waiting = False
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    exit()
+    
+    map_config['type'] = map_type
+    map_config['peaks'] = []
+    print(f"✓ Tipo mappa: {['Uniforme', 'Singola Gaussiana', 'Multi-Gaussiana'][map_type-1]}")
+    
+    # ========== FASE 4: SELEZIONE PICCHI GAUSSIANI (se necessario) ==========
+    if map_type in [2, 3]:
+        context_with_drones_target = {'drones': drone_positions, 'target': target_pos}
+        
+        if map_type == 2:
+            print("\n[4/5] Seleziona centro della GAUSSIANA (1 click + INVIO)")
+            peak_centers = interactive_selection("4. Centro GAUSSIANA", PURPLE, allow_multiple=False, context_items=context_with_drones_target)
+        else:
+            print("\n[4/5] Seleziona centri delle GAUSSIANE (click multipli + INVIO)")
+            peak_centers = interactive_selection("4. Centri GAUSSIANE", PURPLE, allow_multiple=True, context_items=context_with_drones_target)
+        
+        # Per ogni picco, chiedi sigma (via terminale per semplicità)
+        for i, center in enumerate(peak_centers):
+            print(f"\n  Picco #{i+1} in posizione {center}")
+            while True:
+                try:
+                    sigmas = input("  Inserisci Sigma_X, Sigma_Y (es: 2.0,2.0): ")
+                    sx, sy = map(float, sigmas.split(','))
+                    if sx > 0 and sy > 0:
+                        break
+                    print("  Le deviazioni standard devono essere positive.")
+                except ValueError:
+                    print("  Formato errato. Usa: numero,numero")
+            
+            map_config['peaks'].append({
+                'mean': center,
+                'cov': [sx, sy]
+            })
+        
+        print(f"✓ {len(peak_centers)} picchi gaussiani configurati")
+    else:
+        print("\n[4/5] Nessun picco gaussiano necessario (mappa uniforme)")
+    
+    # ========== FASE 5: SELEZIONE OSTACOLI ==========
+    print("\n[5/5] Seleziona posizioni OSTACOLI (click multipli + INVIO, o solo INVIO per nessuno)")
+    
+    # Estrai i centri delle gaussiane per visualizzarli
+    gaussian_centers = [peak['mean'] for peak in map_config['peaks']]
+    
+    # Mostra la griglia con droni, target e gaussiane già posizionati per riferimento
+    def draw_grid_with_context(obstacles):
+        """Disegna la griglia mostrando droni, target, gaussiane e ostacoli"""
+        screen.fill(WHITE)
+        
+        title_text = font_title.render("FASE: 5. Posizioni OSTACOLI", True, BLACK)
+        screen.blit(title_text, (margin, 10))
+        
+        info_text = font_info.render("Click per aggiungere ostacoli (evita droni e target!)", True, BLACK)
+        help_text = font_small.render("Premi INVIO per confermare (anche senza ostacoli)", True, GRAY)
+        screen.blit(info_text, (margin, 35))
+        screen.blit(help_text, (margin, 58))
+        
+        grid_offset_y = margin + info_height
+        for r in range(map_size):
+            for c in range(map_size):
+                x = margin + c * cell_size
+                y = grid_offset_y + r * cell_size
+                
+                cell_color = LIGHT_GRAY
+                label = f"{r},{c}"
+                text_color = BLACK
+                
+                # Droni
+                if (r, c) in drone_positions:
+                    cell_color = BLUE
+                    label = "D"
+                    text_color = WHITE
+                # Target
+                elif (r, c) == target_pos:
+                    cell_color = RED
+                    label = "T"
+                    text_color = WHITE
+                # Centri Gaussiane
+                elif (r, c) in gaussian_centers:
+                    cell_color = PURPLE
+                    label = "G"
+                    text_color = WHITE
+                # Ostacoli
+                elif (r, c) in obstacles:
+                    cell_color = BLACK
+                    label = "X"
+                    text_color = WHITE
+                
+                pygame.draw.rect(screen, cell_color, (x, y, cell_size, cell_size))
+                pygame.draw.rect(screen, GRAY, (x, y, cell_size, cell_size), 1)
+                
+                coord_text = font_small.render(label, True, text_color)
+                text_rect = coord_text.get_rect(center=(x + cell_size//2, y + cell_size//2))
+                screen.blit(coord_text, text_rect)
+        
+        count_text = font_info.render(f"Ostacoli: {len(obstacles)}", True, BLACK)
+        screen.blit(count_text, (margin, window_height - 35))
+        
+        pygame.display.flip()
+    
+    obstacles = []
+    running = True
+    
+    while running:
+        draw_grid_with_context(obstacles)
+        
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                exit()
+            
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                cell = get_cell_from_mouse(event.pos)
+                if cell:
+                    # Non permettere ostacoli su droni o target
+                    if cell in drone_positions or cell == target_pos:
+                        print(f"  ⚠ Non puoi mettere un ostacolo su drone/target!")
+                        continue
+                    
+                    if cell in obstacles:
+                        obstacles.remove(cell)
+                    else:
+                        obstacles.append(cell)
+            
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN:
+                    running = False
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    exit()
+    
+    print(f"✓ {len(obstacles)} ostacoli configurati")
+    
+    # Chiudi la finestra pygame
+    pygame.quit()
+    
+    print("\n=== CONFIGURAZIONE COMPLETATA ===")
+    print(f"Droni: {num_drones}")
+    print(f"Target: {target_pos}")
+    print(f"Tipo mappa: {['Uniforme', 'Singola Gaussiana', 'Multi-Gaussiana'][map_type-1]}")
+    print(f"Ostacoli: {len(obstacles)}")
+    
+    # Creazione elenco drone_positions formattato
+    drone_positions_list = [[pos[0], pos[1]] for pos in drone_positions]
+    
+    # Return dizionario compatibile
     return {
         "alpha": alpha,
         "beta": beta,
-        "b0": b0,
+        "b0": 1,
         "target_pos": target_pos,
-        "dist_type": dist_type,
-        "dist_params": dist_params,
-        "grid_size": grid_size,
-        "threshold_upper": 0.95,     #Valore soglia superiore per decisione presenza target
-        "threshold_lower": 0.05,     #Valore soglia inferiore per decisione assenza target
-        "initial_drones": {
-            "red": [drone_red[0], drone_red[1]],          
-            "green": [drone_green[0], drone_green[1]]
-        }
+        "dist_type": ['uniform', 'gaussian_single', 'gaussian_multi'][map_type-1],
+        "dist_params": {'peaks': [{'mean': p['mean'], 'cov': [[p['cov'][0]**2, 0], [0, p['cov'][1]**2]]} for p in map_config['peaks']]},
+        "grid_size": (map_size, map_size),
+        "threshold_upper": 0.95,
+        "initial_drones": drone_positions_list,
+        "num_drones": num_drones,
+        "obstacles": obstacles
     }
 
-#Funzione per inizializzare la mappa di credenza
+
+# Funzione per inizializzare la mappa di credenza
 def initialize_belief_map(params):
     grid_size = params["grid_size"]
     b0 = params["b0"]
@@ -143,7 +416,7 @@ def initialize_belief_map(params):
 
     if dist_type == 'uniform':
         cell_prob = b0 / (grid_size[0] * grid_size[1])
-        p_map = np.full(grid_size, cell_prob)       #Funzione per creare array di dimensione grid_size con valori uguali a cell_prob
+        p_map = np.full(grid_size, cell_prob)
     elif dist_type in ('gaussian_single', 'gaussian_multi'):
         x, y = np.mgrid[0:grid_size[0], 0:grid_size[1]]
         coord = np.dstack((x, y))
@@ -160,41 +433,59 @@ def initialize_belief_map(params):
                 rv = multivariate_normal(mean, cov)
                 p_map += rv.pdf(coord)
 
-            total_pdf = p_map.sum()
-            if total_pdf > 0:
-                p_map = (p_map / total_pdf) * b0
-            else:
+            # Non normalizzare ancora, prima applichiamo gli ostacoli
+            if p_map.sum() == 0:
                 cell_prob = b0 / (grid_size[0] * grid_size[1])
                 p_map = np.full(grid_size, cell_prob)
     else:
         cell_prob = b0 / (grid_size[0] * grid_size[1])
         p_map = np.full(grid_size, cell_prob)
     
-    p_0 = 1.0 - b0   ##Credenza iniziale che target non sia nell'area
-    return p_map, p_0
-
-
-
-
-
+    # Gestione ostacoli: azzera probabilità nelle celle con ostacoli
+    if 'obstacles' in params and len(params['obstacles']) > 0:
+        for obs_pos in params['obstacles']:
+            r, c = obs_pos
+            p_map[r, c] = 0.0
+    
+    # Normalizzazione finale
+    total_pdf = p_map.sum()
+    if total_pdf > 0:
+        p_map = (p_map / total_pdf) * b0
+    else:
+        # Fallback: distribuzione uniforme solo sulle celle libere
+        cell_prob = b0 / (grid_size[0] * grid_size[1])
+        p_map = np.full(grid_size, cell_prob)
+        if 'obstacles' in params and len(params['obstacles']) > 0:
+            for obs_pos in params['obstacles']:
+                r, c = obs_pos
+                p_map[r, c] = 0.0
+            total_pdf = p_map.sum()
+            if total_pdf > 0:
+                p_map = (p_map / total_pdf) * b0
+    
+    return p_map
 
 
 # --- 2. Logica Core: Aggiornamento Bayesiano ---
 
-def update_bayesian_map(p_map, p_0, inspected_cell, params):
+def update_bayesian_map(p_map, inspected_cell, params):
     alpha = params["alpha"]
     beta = params["beta"]
     target_pos = params["target_pos"]
     
-    is_target_present = (inspected_cell == target_pos)    #Assegno True o False in base alla condizione
-
-    #Osservazione del sensore con modello non ideale
+    is_target_present = (inspected_cell == target_pos)
+    
+    # Osservazione del sensore con modello non ideale
     if is_target_present:
-        if np.random.rand() < beta: observation_Y = 0       #Falso Negativo
-        else: observation_Y = 1                             #Osservazione corretta 
+        if np.random.rand() < beta: 
+            observation_Y = 0  # Falso Negativo
+        else: 
+            observation_Y = 1  # Osservazione corretta 
     else:
-        if np.random.rand() < alpha: observation_Y = 1      #Falso Positivo
-        else: observation_Y = 0                             #Osservazione corretta
+        if np.random.rand() < alpha: 
+            observation_Y = 1  # Falso Positivo
+        else: 
+            observation_Y = 0  # Osservazione corretta
             
     if observation_Y == 1:
         Psi = 1 - beta
@@ -203,26 +494,21 @@ def update_bayesian_map(p_map, p_0, inspected_cell, params):
         Psi = beta
         Phi = 1 - alpha
 
-    #...passaggi intermedi per arrivare a formula finale...
     Omega = Psi - Phi
     p_st = p_map[inspected_cell]
     Z = Phi + Omega * p_st
     
-    if Z < 1e-9:              #Evitare divisione per zero
-        return p_map, p_0
+    if Z < 1e-9:  # Evitare divisione per zero
+        return p_map
 
-    #Aggiornamento delle probabilità, formula finale (n.3 del paper "Analysis of search decision")
-    p_0_t = (Phi * p_0) / Z                        #Aggiornamento probabilità fuori area
-    p_map_t = (Phi * p_map) / Z                    #Aggiornamento celle non ispezionate
-    p_map_t[inspected_cell] = (Psi * p_st) / Z     #Aggiornamento cella ispezionata
+    # Aggiornamento delle probabilità
+    p_map_t = (Phi * p_map) / Z
+    p_map_t[inspected_cell] = (Psi * p_st) / Z
     
-    return p_map_t, p_0_t
+    return p_map_t
 
-# Funzione per controllare soglie di decisione
-def check_decision_thresholds(p_map, p_0, params):
-    B_t = p_map.sum()
-    if B_t <= params["threshold_lower"]:
-        return f"DECISIONE: ASSENTE (B(t) < {params['threshold_lower']:.2f})"
+
+def check_decision_thresholds(p_map, params):
     if np.any(p_map >= params["threshold_upper"]):
         cell_idx = np.unravel_index(np.argmax(p_map), p_map.shape)
         cell_number = cell_idx[1] * params["grid_size"][0] + cell_idx[0]
@@ -230,169 +516,254 @@ def check_decision_thresholds(p_map, p_0, params):
     return None
 
 
+# --- 3. Logica strategia di movimento ad Asta ---
+
+def calculate_utility_map(p_map, drone_pos, obstacle_map):
+    """Calcola la mappa di utilità U = P/(d+1) per un drone"""
+    grid_w, grid_h = p_map.shape
+    
+    # Calcola distanza di Manhattan per ogni cella
+    xx, yy = np.mgrid[0:grid_w, 0:grid_h]
+    distance_map = np.abs(xx - drone_pos[0]) + np.abs(yy - drone_pos[1])
+    
+    # Calcola utilità U = P / (d + 1)
+    utility_map = p_map / (distance_map + 1.0)
+    
+    # Azzera utilità per ostacoli
+    if obstacle_map is not None:
+        utility_map[obstacle_map == 1] = -np.inf
+    
+    return utility_map
 
 
+def create_wish_list(utility_map, drone_pos):
+    """Crea lista dei desideri ordinata dalla migliore alla peggiore"""
+    grid_w, grid_h = utility_map.shape
+    
+    # Crea lista di tuple (utilità, posizione)
+    wish_list = []
+    for r in range(grid_w):
+        for c in range(grid_h):
+            if utility_map[r, c] > -np.inf:  # Escludi ostacoli
+                wish_list.append((utility_map[r, c], (r, c)))
+    
+    # Ordina per utilità decrescente
+    wish_list.sort(reverse=True, key=lambda x: x[0])
+    
+    return wish_list
 
 
-#---3. Logica strategia di movimento Greedy con Asta ---
-
-#Funzione per creare una mappa di distanze Euclidee/Manhattan
-def _create_distance_map(pos, grid_size):
+def auction_based_planning(p_map, drone_positions, grid_size, obstacle_map=None):
+    """
+    Sistema di asta per assegnare celle target ai droni.
+    Ogni drone crea una lista dei desideri e fa offerte iterative.
+    """
+    num_drones = len(drone_positions)
     grid_w, grid_h = grid_size
-    xx, yy = np.mgrid[0:grid_w, 0:grid_h]           #Array con coordinate x e y, non serve dstack qui
-
-    #distance_map = np.sqrt((xx - pos[0])**2 + (yy - pos[1])**2)        #Distanza Euclidea
-    distance_map=np.abs(xx - pos[0]) + abs(yy - pos[1])                 #Distanza di Manhattan
-    return distance_map
-
-#Funzione per scegliere prossima mossa con logica ad Asta
-def get_next_proximity_moves(p_map, pos_red, pos_green, grid_size):
-    grid_w, grid_h = grid_size
     
-    # 1. Calcola mappe di distanza per entrambi
-    dist_map_red = _create_distance_map(pos_red, grid_size)
-    dist_map_green = _create_distance_map(pos_green, grid_size)
+    # 1. Calcola utilità e crea liste dei desideri per ogni drone
+    drone_data = []
+    for idx, pos in enumerate(drone_positions):
+        utility_map = calculate_utility_map(p_map, pos, obstacle_map)
+        wish_list = create_wish_list(utility_map, pos)
+        drone_data.append({
+            'id': idx,
+            'pos': tuple(pos),
+            'wish_list': wish_list,
+            'wish_index': 0,  # Indice attuale nella wish list
+            'assigned_cell': None,
+            'assigned': False
+        })
     
-    # 2. Calcola mappe di punteggio iniziali per entrambi - [Score = Probabilità / (Distanza + 1)]
-    score_map_red = p_map / (dist_map_red + 1.0)    #+1 per evitare divisione per zero
-    score_map_green = p_map / (dist_map_green + 1.0)
+    # 2. Dizionario per tracciare le offerte per ogni cella
+    # Format: {cell: {'drone_id': id, 'utility': value}}
+    cell_bids = {}
     
-    # 3. Trova celle con miglior punteggio per entrambi
-    best_target_red = np.unravel_index(np.argmax(score_map_red), p_map.shape)
-    max_score_red = score_map_red[best_target_red]
+    # 3. Processo iterativo di bidding
+    max_iterations = grid_w * grid_h * num_drones  # Safety limit
+    iteration = 0
     
-    best_target_green = np.unravel_index(np.argmax(score_map_green), p_map.shape)
-    max_score_green = score_map_green[best_target_green]
-    
-    # 4. Asta di priorità, a parità di cella scelta il rosso ha priorità
-    if max_score_red >= max_score_green:
-        # VINCE IL ROSSO (o pareggio, priorità al rosso per convenzione)
-        final_target_red = best_target_red
+    while iteration < max_iterations:
+        iteration += 1
+        any_change = False
         
-        # Il verde deve ricalcolare escludendo il target del rosso
-        score_map_green[final_target_red] = -1.0 
-        final_target_green = np.unravel_index(np.argmax(score_map_green), p_map.shape)
-       
-        if score_map_green[final_target_green] == 0:   #Se cella da esplorare ha probabilità 0, rimane fermo
-            final_target_green = pos_green  
+        # Ogni drone fa un'offerta per la sua scelta corrente
+        for drone in drone_data:
+            if drone['assigned']:
+                continue
             
-    else:
-        # VINCE IL VERDE
-        final_target_green = best_target_green
-        
-        # Il rosso deve ricalcolare escludendo il target del verde
-        score_map_red[final_target_green] = -1.0
-        final_target_red = np.unravel_index(np.argmax(score_map_red), p_map.shape)
-
-        if score_map_red[final_target_red] == 0:       #Se cella da esplorare ha probabilità 0, rimane fermo
-            final_target_red = pos_red
-
-
-    # 5. Calcolo delle Mosse (1 passo verso i target finali)
-    dx_r = np.sign(final_target_red[0] - pos_red[0])            #Calcola direzione mossa su x
-    dy_r = np.sign(final_target_red[1] - pos_red[1])            #Calcola direzione mossa su y
-    candidate_red = [
-        int(max(0, min(grid_w - 1, pos_red[0] + dx_r))),        #Assicura che non esca dai bordi
-        int(max(0, min(grid_h - 1, pos_red[1] + dy_r)))
-    ]
-
-    dx_g = np.sign(final_target_green[0] - pos_green[0])
-    dy_g = np.sign(final_target_green[1] - pos_green[1])
-    candidate_green = [
-        int(max(0, min(grid_w - 1, pos_green[0] + dx_g))),
-        int(max(0, min(grid_h - 1, pos_green[1] + dy_g)))
-    ]
-
-    # 6. Vincoli collisione/swap con priorità al ROSSO
-    new_pos_red = candidate_red
-    new_pos_green = candidate_green
-
-    # Se entrambi selezionano la stessa cella, ROSSO ha priorità e il VERDE resta fermo
-    if tuple(candidate_red) == tuple(candidate_green):
-        new_pos_green = list(pos_green)
-    
-    # Se le mosse provocherebbero uno swap simultaneo, il VERDE devia e il rosso va al suo candidato
-    elif tuple(candidate_red) == tuple(pos_green) and tuple(candidate_green) == tuple(pos_red):
-        deviations = []
-        
-        possible_moves = [
-            (1, 0), (-1, 0), (0, 1), (0, -1),   # Cardinali
-            (1, 1), (1, -1), (-1, 1), (-1, -1)  # Diagonali
-        ]
-
-        for dx, dy in possible_moves:
-            nx = pos_green[0] + dx 
-            ny = pos_green[1] + dy 
+            # Ottieni la cella desiderata corrente
+            if drone['wish_index'] >= len(drone['wish_list']):
+                # Nessuna cella disponibile, resta fermo
+                drone['assigned_cell'] = drone['pos']
+                drone['assigned'] = True
+                continue
             
-            if 0 <= nx < grid_w and 0 <= ny < grid_h:
-                candidate = (nx, ny)
+            utility, desired_cell = drone['wish_list'][drone['wish_index']]
+            
+            # Controlla se la cella è la posizione corrente di un altro drone
+            is_occupied_by_other = any(
+                d['pos'] == desired_cell and d['id'] != drone['id'] 
+                for d in drone_data
+            )
+            
+            if is_occupied_by_other:
+                # Salta questa cella e passa alla prossima
+                drone['wish_index'] += 1
+                any_change = True
+                continue
+            
+            # Fa un'offerta per questa cella
+            if desired_cell not in cell_bids:
+                # Prima offerta per questa cella
+                cell_bids[desired_cell] = {
+                    'drone_id': drone['id'],
+                    'utility': utility
+                }
+            else:
+                # C'è già un'offerta, confronta le utilità
+                current_bid = cell_bids[desired_cell]
                 
-                # REGOLE PER LA DEVIAZIONE:
-                if candidate != tuple(pos_red) and candidate != tuple(pos_green):
-                    deviations.append(candidate)
+                if utility > current_bid['utility']:
+                    # Questo drone vince, scalza il precedente
+                    # Il drone scalzato dovrà riprovare
+                    for d in drone_data:
+                        if d['id'] == current_bid['drone_id']:
+                            d['wish_index'] += 1
+                            d['assigned'] = False
+                            any_change = True
+                            break
+                    
+                    # Aggiorna con la nuova offerta
+                    cell_bids[desired_cell] = {
+                        'drone_id': drone['id'],
+                        'utility': utility
+                    }
+                else:
+                    # Questo drone perde, deve provare la prossima scelta
+                    drone['wish_index'] += 1
+                    any_change = True
         
-        if deviations:
-            new_pos_green = list(deviations[0])
+        # Assegna temporaneamente le celle ai droni vincenti
+        for cell, bid in cell_bids.items():
+            drone_id = bid['drone_id']
+            drone_data[drone_id]['assigned_cell'] = cell
+            drone_data[drone_id]['assigned'] = True
+        
+        # Se nessun cambiamento, tutti i droni sono assegnati
+        if not any_change:
+            break
+    
+    # 4. Previeni swap simultanei
+    # Due droni non possono scambiarsi le posizioni
+    for i in range(num_drones):
+        for j in range(i+1, num_drones):
+            drone_i = drone_data[i]
+            drone_j = drone_data[j]
+            
+            if (drone_i['assigned_cell'] == drone_j['pos'] and 
+                drone_j['assigned_cell'] == drone_i['pos']):
+                # Swap detected! Il drone con indice maggiore resta fermo
+                drone_j['assigned_cell'] = drone_j['pos']
+    
+    # 5. Calcola le mosse effettive (un passo verso la cella assegnata)
+    final_moves = []
+    for drone in drone_data:
+        target_cell = drone['assigned_cell']
+        current_pos = drone['pos']
+        
+        if target_cell == current_pos:
+            # Resta fermo
+            final_moves.append(list(current_pos))
         else:
-            # Se non può scappare nemmeno in diagonale, blocchiamo tutto
-            print("Errore nello swap della posizione")
-            new_pos_green = list(pos_green)
-            new_pos_red = list(pos_red)
-
-    #Vincolo che evita incrocio di traiettorie, verde aspetta
-    elif (pos_red[0] + candidate_red[0] == pos_green[0] + candidate_green[0]) and \
-         (pos_red[1] + candidate_red[1] == pos_green[1] + candidate_green[1]):
-         
-        # Il Verde lascia passare il Rosso e aspetta
-        new_pos_green = list(pos_green)
-
-    #Restituisco le nuove coordinate da raggiungere ai droni
-    return new_pos_red, new_pos_green
-
-
-
-
-
+            # Muovi di un passo verso il target
+            dr = np.sign(target_cell[0] - current_pos[0])
+            dc = np.sign(target_cell[1] - current_pos[1])
+            
+            # Priorità alla direzione con distanza maggiore
+            dist_r = abs(target_cell[0] - current_pos[0])
+            dist_c = abs(target_cell[1] - current_pos[1])
+            
+            if dist_r >= dist_c and dr != 0:
+                # Muovi verticalmente
+                next_pos = (current_pos[0] + dr, current_pos[1])
+            elif dc != 0:
+                # Muovi orizzontalmente
+                next_pos = (current_pos[0], current_pos[1] + dc)
+            else:
+                # Già nella posizione target
+                next_pos = current_pos
+            
+            # Verifica che la mossa sia valida
+            if (0 <= next_pos[0] < grid_w and 0 <= next_pos[1] < grid_h):
+                # Controlla ostacoli
+                if obstacle_map is not None and obstacle_map[next_pos[0], next_pos[1]] == 1:
+                    next_pos = current_pos  # Resta fermo se c'è un ostacolo
+                
+                final_moves.append(list(next_pos))
+            else:
+                final_moves.append(list(current_pos))
+    
+    # 6. Verifica collisioni nella mossa finale
+    # Se due droni vanno nella stessa cella, quello con indice minore ha priorità
+    for i in range(num_drones):
+        for j in range(i+1, num_drones):
+            if final_moves[i] == final_moves[j]:
+                # Collisione! Il drone j resta fermo
+                final_moves[j] = list(drone_positions[j])
+    
+    return final_moves
 
 
 # --- 4. Funzioni di Simulazione (Pygame) ---
 
-def draw_static_background(surface, p_map, font_cell, params):
-    """
-    Funzione che disegna la griglia, la heatmap e il testo
-    solo una volta sulla superficie di sfondo.
-    """
+def draw_static_background(surface, p_map, font_cell, params, obstacle_map):
+    """Disegna la griglia, la heatmap e il testo sulla superficie di sfondo"""
     GRID_WIDTH = surface.get_width()  
     CELL_SIZE = GRID_WIDTH // params["grid_size"][0]
     BLACK = (0, 0, 0)
+    WHITE = (255, 255, 255)
 
-    surface.fill((255, 255, 255)) # Pulisce lo sfondo
+    surface.fill(WHITE)
     max_prob = p_map.max() 
     
     for r in range(params["grid_size"][0]):
         for c in range(params["grid_size"][1]):
             prob = p_map[r, c]
             
-            # Heatmap
-            color_val = 0
-            if max_prob > 1e-9: 
-                color_val = int(255 * (prob / max_prob))
-            color = (max(0, 255 - color_val), max(0, 255 - color_val), 255)
+            # Check se è un ostacolo
+            is_obstacle = obstacle_map[r, c] == 1 if obstacle_map is not None else False
             
-            # In Pygame: x = colonna (c), y = riga (r)
-            rect = pygame.Rect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE)
-            pygame.draw.rect(surface, color, rect)
-            pygame.draw.rect(surface, BLACK, rect, 1) # Bordo
+            if is_obstacle:
+                # Ostacoli: cella nera con "X"
+                color = BLACK
+                rect = pygame.Rect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                pygame.draw.rect(surface, color, rect)
+                pygame.draw.rect(surface, BLACK, rect, 1)
+                
+                # Disegna "X" bianca
+                text = font_cell.render("X", True, WHITE)
+                text_rect = text.get_rect(center=(c * CELL_SIZE + CELL_SIZE//2, r * CELL_SIZE + CELL_SIZE//2))
+                surface.blit(text, text_rect)
+            else:
+                # Heatmap normale
+                color_val = 0
+                if max_prob > 1e-9: 
+                    color_val = int(255 * (prob / max_prob))
+                color = (max(0, 255 - color_val), max(0, 255 - color_val), 255)
+                
+                rect = pygame.Rect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                pygame.draw.rect(surface, color, rect)
+                pygame.draw.rect(surface, BLACK, rect, 1)
 
-            # Renderizza il testo in percentuale
-            text = font_cell.render(f"{prob * 100:.3f}%", True, BLACK)
-            surface.blit(text, (c * CELL_SIZE + 5, r * CELL_SIZE + 5))
+                # Renderizza il testo in percentuale
+                text = font_cell.render(f"{prob * 100:.3f}%", True, BLACK)
+                surface.blit(text, (c * CELL_SIZE + 5, r * CELL_SIZE + 5))
 
-def draw_elements(screen, p_0, B_t, max_prob, drones, params, font_sidebar, decision, simulation_started, GRID_WIDTH, CELL_SIZE, auto_mode_active, steps_taken):
-    """
-    Funzione che disegna solo gli elementi "dinamici"
-    (Droni, Target, Sidebar) che cambiano ad ogni frame.
-    """
+
+def draw_elements(screen, max_prob, drone_positions, params, font_sidebar, decision, 
+                  simulation_started, GRID_WIDTH, CELL_SIZE, auto_mode_active, combined_steps):
+    """Disegna gli elementi dinamici (Droni, Target, Sidebar)"""
     SIDEBAR_WIDTH = 400
     grid_w, grid_h = params.get("grid_size", (10, 10))
     
@@ -401,8 +772,15 @@ def draw_elements(screen, p_0, B_t, max_prob, drones, params, font_sidebar, deci
     RED = (255, 0, 0)
     GREEN = (0, 200, 0)
     BLUE = (0, 0, 255)
+    ORANGE = (255, 165, 0)
+    CYAN = (0, 255, 255)
+    MAGENTA = (255, 0, 255)
+    YELLOW = (255, 255, 0)
     GRAY = (200, 200, 200)
     WHITE = (255, 255, 255)
+
+    # Lista colori droni dinamici
+    DRONE_COLORS = [RED, GREEN, BLUE, ORANGE, CYAN, MAGENTA, YELLOW, (128, 0, 128), (255, 192, 203), (165, 42, 42)]
 
     # --- Disegna il Target Reale (come una X) ---
     tx, ty = params["target_pos"]
@@ -410,114 +788,113 @@ def draw_elements(screen, p_0, B_t, max_prob, drones, params, font_sidebar, deci
     pygame.draw.line(screen, BLACK, target_rect.topleft, target_rect.bottomright, 3)
     pygame.draw.line(screen, BLACK, target_rect.topright, target_rect.bottomleft, 3)
 
-    # --- Disegna i Droni (mostra sempre le posizioni iniziali/attuali) ---
-    # Disegniamo i droni anche prima che la simulazione inizi, in modo che
-    # le posizioni specificate dall'utente siano visibili immediatamente.
-    red_pos = drones.get("red", [-1, 0])
-    red_center = (red_pos[1] * CELL_SIZE + CELL_SIZE // 2, red_pos[0] * CELL_SIZE + CELL_SIZE // 2)
-    pygame.draw.circle(screen, RED, red_center, CELL_SIZE // 3, 4)
-
-    green_pos = drones.get("green", [grid_w - 1, grid_h - 1])
-    green_center = (green_pos[1] * CELL_SIZE + CELL_SIZE // 2, green_pos[0] * CELL_SIZE + CELL_SIZE // 2)
-    pygame.draw.circle(screen, GREEN, green_center, CELL_SIZE // 3, 4)
+    # --- Disegna i Droni con colori dinamici ---
+    for idx, d_pos in enumerate(drone_positions):
+        drone_center = (d_pos[1] * CELL_SIZE + CELL_SIZE // 2, d_pos[0] * CELL_SIZE + CELL_SIZE // 2)
+        color = DRONE_COLORS[idx % len(DRONE_COLORS)]
+        pygame.draw.circle(screen, color, drone_center, CELL_SIZE // 3, 4)
 
     # --- Disegna la Sidebar ---
     sidebar_rect = pygame.Rect(GRID_WIDTH, 0, SIDEBAR_WIDTH, GRID_WIDTH)
     pygame.draw.rect(screen, GRAY, sidebar_rect)
     
-    text_b = font_sidebar.render(f"Credenza Totale B(t):", True, BLACK)
-    text_b_val = font_sidebar.render(f"{B_t:.6f}", True, BLACK)
-    text_p0 = font_sidebar.render(f"Credenza Nulla p0(t):", True, BLACK)
-    text_p0_val = font_sidebar.render(f"{p_0:.6f}", True, BLACK)
-    
-    # Barra B(t)
-    pygame.draw.rect(screen, WHITE, (GRID_WIDTH + 20, 100, SIDEBAR_WIDTH - 40, 30))
-    pygame.draw.rect(screen, BLUE, (GRID_WIDTH + 20, 100, (SIDEBAR_WIDTH - 40) * min(B_t, 1.0), 30))
-    thr_l_pos = (GRID_WIDTH + 20) + (SIDEBAR_WIDTH - 40) * params["threshold_lower"]
-    pygame.draw.line(screen, RED, (thr_l_pos, 95), (thr_l_pos, 135), 3)
-
     # Barra p_c max
     text_max_p = font_sidebar.render(f"Max Prob Cella (p_c):", True, BLACK)
     text_max_p_val = font_sidebar.render(f"{max_prob:.6f}", True, BLACK)
     pygame.draw.rect(screen, WHITE, (GRID_WIDTH + 20, 250, SIDEBAR_WIDTH - 40, 30))
-    pygame.draw.rect(screen, (255,165,0), (GRID_WIDTH + 20, 250, (SIDEBAR_WIDTH - 40) * min(max_prob, 1.0), 30))
+    pygame.draw.rect(screen, ORANGE, (GRID_WIDTH + 20, 250, (SIDEBAR_WIDTH - 40) * min(max_prob, 1.0), 30))
     thr_u_pos = (GRID_WIDTH + 20) + (SIDEBAR_WIDTH - 40) * params["threshold_upper"]
     pygame.draw.line(screen, GREEN, (thr_u_pos, 245), (thr_u_pos, 285), 3)
 
-    text_steps = font_sidebar.render(f"Mosse Fatte: {steps_taken}", True, BLACK)
-    screen.blit(text_steps, (GRID_WIDTH + 20, 430))
-    
+    text_steps = font_sidebar.render(f"Mosse Totali: {combined_steps}", True, BLACK)
+    screen.blit(text_steps, (GRID_WIDTH + 20, 410))
+
     # Testo e colore modalità automatica
     auto_text = "MODALITA' AUTO: "
     if auto_mode_active:
-        auto_text += "ATTIVA (Smart Auction)"
+        auto_text += "ATTIVA (Asta)"
         auto_color = GREEN
     else:
         auto_text += "NON ATTIVA"
         auto_color = BLACK
     
     text_auto = font_sidebar.render(auto_text, True, auto_color)
-    screen.blit(text_auto, (GRID_WIDTH + 20, 470))
+    screen.blit(text_auto, (GRID_WIDTH + 20, 500))
     
     text_start = font_sidebar.render("Premi SPAZIO per Auto-Mode", True, BLACK)
-    screen.blit(text_start, (GRID_WIDTH + 20, 500))
+    screen.blit(text_start, (GRID_WIDTH + 20, 540))
 
     text_gif = font_sidebar.render("Premi 'g' per REC/STOP GIF", True, (100, 0, 100))
-    screen.blit(text_gif, (GRID_WIDTH + 20, 530))
+    screen.blit(text_gif, (GRID_WIDTH + 20, 580))
 
-    screen.blit(text_b, (GRID_WIDTH + 20, 50))
-    screen.blit(text_b_val, (GRID_WIDTH + 40, 140))
     screen.blit(text_max_p, (GRID_WIDTH + 20, 200))
     screen.blit(text_max_p_val, (GRID_WIDTH + 40, 290))
-    screen.blit(text_p0, (GRID_WIDTH + 20, 350))
-    screen.blit(text_p0_val, (GRID_WIDTH + 40, 390))
     
-    # Disegna il messaggio di esito o riavvio se presente
-    if decision:
-        text_dec = font_sidebar.render(decision, True, RED)
-        screen.blit(text_dec, (GRID_WIDTH + 20, 550))
-        text_repeat = font_sidebar.render("Premi 'R' per Riavviare", True, BLACK)
-        text_quit = font_sidebar.render("Premi 'ESC' per Uscire", True, BLACK)
-        screen.blit(text_repeat, (GRID_WIDTH + 20, 600))
-        screen.blit(text_quit, (GRID_WIDTH + 20, 650))
+    # Info numero droni
+    text_drones = font_sidebar.render(f"Droni attivi: {len(drone_positions)}", True, BLACK)
+    screen.blit(text_drones, (GRID_WIDTH + 20, 450))
 
 
 def run_simulation(params):
-    
     pygame.init()
     
     # Setup Schermo
     grid_w = params["grid_size"][0]
     grid_h = params["grid_size"][1]
-    cell_size = 60
-    sidebar_w = 400
+    
+    # Ottiene le dimensioni dello schermo disponibile
+    display_info = pygame.display.Info()
+    available_width = display_info.current_w
+    available_height = display_info.current_h
+    
+    # Riserva spazio per la sidebar e margini
+    sidebar_w = 350
+    margin_horizontal = 50
+    margin_vertical = 150
+    
+    # Calcola la dimensione massima delle celle per adattarsi allo schermo
+    max_cell_from_width = (available_width - sidebar_w - margin_horizontal) // grid_w
+    max_cell_from_height = (available_height - margin_vertical) // grid_h
+    cell_size = min(max_cell_from_width, max_cell_from_height, 50)
+    cell_size = max(cell_size, 15)
+    
     GRID_WIDTH = grid_w * cell_size
     screen_w = GRID_WIDTH + sidebar_w
     screen_h = grid_h * cell_size
     
-    screen = pygame.display.set_mode((screen_w, screen_h))
-    pygame.display.set_caption("Simulatore Ricerca con Droni - Strategia Greedy con Asta")
+    min_height = 650
+    screen_h = max(screen_h, min_height)
     
-    font_cell = pygame.font.SysFont(None, 18) 
-    font_sidebar = pygame.font.SysFont(None, 24)  # Font più piccolo per la sidebar
+    print(f"\n=== Configurazione Display ===")
+    print(f"Risoluzione schermo: {available_width}x{available_height}")
+    print(f"Dimensione celle: {cell_size}px")
+    print(f"Griglia: {GRID_WIDTH}px, Sidebar: {sidebar_w}px")
+    print(f"Finestra: {screen_w}x{screen_h}\n")
+    
+    screen = pygame.display.set_mode((screen_w, screen_h))
+    pygame.display.set_caption("Simulatore Ricerca con Droni - Strategia ad Asta")
+    
+    # Font
+    font_cell_size = max(10, min(18, cell_size // 3))
+    font_cell = pygame.font.SysFont(None, font_cell_size)
+    font_sidebar = pygame.font.SysFont(None, 24)
     
     # Setup Stato
-    p_map, p_0 = initialize_belief_map(params)
+    p_map = initialize_belief_map(params)
     
-    B_t = p_map.sum()       #Credenza totale iniziale
-    max_prob = p_map.max()  #Probabilità massima iniziale
+    # Inizializza obstacle_map
+    obstacle_map = None
+    if 'obstacles' in params and len(params['obstacles']) > 0:
+        obstacle_map = np.zeros((grid_w, grid_h), dtype=int)
+        for obs_pos in params['obstacles']:
+            r, c = obs_pos
+            obstacle_map[r, c] = 1
     
-    simulation_started = False  # Flag per avvio simulazione
-    
-    # Usa le posizioni iniziali dei droni specificate dall'utente
-    drones = params["initial_drones"]
-    
-    # Comandi per movimento
-    valid_move_keys = [
-        pygame.K_UP, pygame.K_DOWN, pygame.K_LEFT, pygame.K_RIGHT,
-        pygame.K_w, pygame.K_a, pygame.K_s, pygame.K_d
-    ]
-    
+    max_prob = p_map.max()
+    simulation_started = False
+
+    # Posizioni iniziali dei droni
+    drone_positions = [list(pos) for pos in params["initial_drones"]]
     cells_to_inspect = []
     
     background_surface = pygame.Surface((GRID_WIDTH, screen_h))
@@ -529,39 +906,33 @@ def run_simulation(params):
     
     auto_mode_active = False
     auto_move_timer = 0
-    AUTO_MOVE_INTERVAL = 1500 # 1.5 secondi in millisecondi, tra una mossa e l'altra
-    
-    steps_taken = 0
+    AUTO_MOVE_INTERVAL = 1500  # 1.5 secondi
 
+    combined_steps = 0
     is_recording = False
     frames = []
 
     # Loop di Simulazione
     while running:
         
-        if auto_mode_active and not decision:           # Movimento Automatico
-            current_time = pygame.time.get_ticks()      # Tempo attuale in ms
+        if auto_mode_active and not decision:
+            current_time = pygame.time.get_ticks()
             
-            if current_time - auto_move_timer > AUTO_MOVE_INTERVAL:  #orologio - timestamp dell'ultima mossa > tempo che decidiamo noi
-                
-                move_red, move_green = get_next_proximity_moves(
-                    p_map, 
-                    drones["red"], 
-                    drones["green"], 
-                    params["grid_size"]
+            if current_time - auto_move_timer > AUTO_MOVE_INTERVAL:
+                # Pianifica le mosse usando l'algoritmo ad asta
+                new_positions = auction_based_planning(
+                    p_map,
+                    drone_positions,
+                    params["grid_size"],
+                    obstacle_map=obstacle_map
                 )
-                # Applica le mosse (collisioni/swap già risolti in get_next_proximity_moves)
-                drones["red"] = move_red
-                cells_to_inspect.append(tuple(move_red))
 
-                drones["green"] = move_green
-                cells_to_inspect.append(tuple(move_green))
+                for idx, new_pos in enumerate(new_positions):
+                    drone_positions[idx] = new_pos
+                    cells_to_inspect.append(tuple(new_pos))
                     
-                # Resetta il timer per il prossimo intervallo
                 auto_move_timer = current_time
-                
-                steps_taken += 1                # Conta le mosse effettuate
-        
+                combined_steps += 1
         
         # Gestione Input
         for event in pygame.event.get():
@@ -569,20 +940,17 @@ def run_simulation(params):
                 return "quit" 
                 
             if event.type == pygame.KEYDOWN:
-
                 if event.key == pygame.K_g:
                     is_recording = not is_recording
                     if is_recording:
                         print("🔴 Registrazione avviata")
-                        frames = [] # Reset buffer
+                        frames = []
                     else:
                         print("💾 Salvataggio GIF in corso")
-                        # Genera nome file
                         filename = f'simulazione_{datetime.now().strftime("%Y%m%d_%H%M%S")}.gif'
-                        # Salva
                         imageio.mimsave(filename, frames, fps=30, loop=0)
                         print(f"✅ GIF salvata: {filename}")
-                        frames = [] # Libera memoria
+                        frames = []
 
                 if event.key == pygame.K_ESCAPE:
                     return "quit" 
@@ -591,145 +959,61 @@ def run_simulation(params):
                     if event.key == pygame.K_r:
                         return "restart" 
                 
-                if event.key == pygame.K_SPACE and not decision:
+                elif event.key == pygame.K_SPACE and not decision:
                     if not auto_mode_active:
-                        print("Modalità automatica ATTIVATA (Smart Auction).")
+                        print("Modalità automatica ATTIVATA (Asta).")
                         auto_mode_active = True
-                        auto_move_timer = pygame.time.get_ticks()
-                        simulation_started = True
+                        auto_move_timer = pygame.time.get_ticks() 
+
+                        if not simulation_started:
+                            simulation_started = True
+                            force_redraw = True 
                     else:
                         print("Modalità automatica DISATTIVATA.")
                         auto_mode_active = False
-                
-                elif not simulation_started and event.key in valid_move_keys:
-                    simulation_started = True
-                
-                elif event.key in valid_move_keys:
-                    if auto_mode_active:
-                        print("Override manuale. Modalità automatica DISATTIVATA.")
-                        auto_mode_active = False
 
-                    # Logica di movimento normale: candidate senza limiti, poi controlli
-                    candidate = None
-
-                    if event.key == pygame.K_UP:
-                        candidate = [drones["red"][0], drones["red"][1] - 1]
-                        other = tuple(drones.get("green"))
-                        label_other = "verde"
-                        drone_key = "red"
-                        coord_index = 1
-                    elif event.key == pygame.K_DOWN:
-                        candidate = [drones["red"][0], drones["red"][1] + 1]
-                        other = tuple(drones.get("green"))
-                        label_other = "verde"
-                        drone_key = "red"
-                        coord_index = 1
-                    elif event.key == pygame.K_LEFT:
-                        candidate = [drones["red"][0] - 1, drones["red"][1]]
-                        other = tuple(drones.get("green"))
-                        label_other = "verde"
-                        drone_key = "red"
-                        coord_index = 0
-                    elif event.key == pygame.K_RIGHT:
-                        candidate = [drones["red"][0] + 1, drones["red"][1]]
-                        other = tuple(drones.get("green"))
-                        label_other = "verde"
-                        drone_key = "red"
-                        coord_index = 0
-                    elif event.key == pygame.K_w:
-                        candidate = [drones["green"][0], drones["green"][1] - 1]
-                        other = tuple(drones.get("red"))
-                        label_other = "rosso"
-                        drone_key = "green"
-                        coord_index = 1
-                    elif event.key == pygame.K_s:
-                        candidate = [drones["green"][0], drones["green"][1] + 1]
-                        other = tuple(drones.get("red"))
-                        label_other = "rosso"
-                        drone_key = "green"
-                        coord_index = 1
-                    elif event.key == pygame.K_a:
-                        candidate = [drones["green"][0] - 1, drones["green"][1]]
-                        other = tuple(drones.get("red"))
-                        label_other = "rosso"
-                        drone_key = "green"
-                        coord_index = 0
-                    elif event.key == pygame.K_d:
-                        candidate = [drones["green"][0] + 1, drones["green"][1]]
-                        other = tuple(drones.get("red"))
-                        label_other = "rosso"
-                        drone_key = "green"
-                        coord_index = 0
-
-                    if candidate is not None:
-                        cx, cy = candidate
-                        # Controllo fuori mappa
-                        if not (0 <= cx < grid_w and 0 <= cy < grid_h):
-                            print("Mossa evitata: fuori mappa")
-                        # Controllo collisione con l'altro drone
-                        elif tuple(candidate) == other:
-                            print(f"Mossa evitata: collisione con il drone {label_other}")
-                        else:
-                            # Aggiorna posizione e aggiungi cella da ispezionare
-                            drones[drone_key][coord_index] = candidate[coord_index]
-                            cells_to_inspect.append(tuple(drones[drone_key]))
-
-                            if simulation_started and not decision:
-                                steps_taken += 1
-
-        # --- Aggiornamento Stato ---
+        # Aggiornamento Stato
         if cells_to_inspect and not decision:
-            
             for cell in cells_to_inspect:
-                p_map, p_0 = update_bayesian_map(p_map, p_0, cell, params)
-                decision = check_decision_thresholds(p_map, p_0, params)
-                if decision: break
+                p_map = update_bayesian_map(p_map, cell, params)
+                decision = check_decision_thresholds(p_map, params)
+                if decision: 
+                    break
             
-            B_t = p_map.sum()
             max_prob = p_map.max()
-            
             cells_to_inspect = [] 
             force_redraw = True 
 
-        #disegno 
+        # Disegno Ottimizzato
         if force_redraw:
-            draw_static_background(background_surface, p_map, font_cell, params)
+            draw_static_background(background_surface, p_map, font_cell, params, obstacle_map)
             force_redraw = False 
 
         screen.blit(background_surface, (0, 0))
-        
-        draw_elements(screen, p_0, B_t, max_prob, drones, params, font_sidebar, decision, simulation_started, GRID_WIDTH, cell_size, auto_mode_active, steps_taken)
+        draw_elements(screen, max_prob, drone_positions, params, font_sidebar, decision, 
+                     simulation_started, GRID_WIDTH, cell_size, auto_mode_active, combined_steps)
         
         if is_recording:
-            # Disegna un pallino rosso in alto a destra come indicatore di REC
             pygame.draw.circle(screen, (255, 0, 0), (screen_w - 20, 20), 10)
-
 
         pygame.display.flip() 
 
         if is_recording:
-            # 1. Cattura l'intera schermata (griglia + barra laterale)
             table_rect = pygame.Rect(0, 0, screen_w, screen_h)
             sub_surface = screen.subsurface(table_rect)
-            
-            # 2. Estrae i pixel
             frame_data = pygame.surfarray.array3d(sub_surface)
-            
-            # 3. Corregge rotazione e flip (Pygame -> ImageIO format)
             frame_data = np.rot90(frame_data)
             frame_data = np.flipud(frame_data)
-            
-            # 4. Aggiunge al buffer
             frames.append(frame_data)
             
         clock.tick(30) 
 
 
-# --- 5. Funzione Main (Gestisce il loop "Riavvia") ---
+# --- 5. Funzione Main ---
 
 def main():
     while True:
-        params = get_user_parameters()         #assegno al dizionario params, tutti i valori che inserisco da utente
+        params = get_user_parameters()
         result = run_simulation(params)
         pygame.quit() 
         if result == "quit":
