@@ -8,6 +8,7 @@ from scipy.stats import multivariate_normal
 import sys
 import imageio
 from datetime import datetime
+from collections import deque
 
 # Parametri di default
 DEFAULT_MAP_SIZE = 15  # Dimensione lato mappa quadrata
@@ -508,6 +509,67 @@ def update_bayesian_map(p_map, inspected_cell, params):
     return p_map_t
 
 
+def precompute_all_pairs_distances(map_size, obstacle_map):
+    """
+    Pre-calcola TUTTE le distanze tra coppie di celle libere usando BFS.
+    Tiene conto dei muri (obstacle_map) per calcolare la distanza reale.
+    
+    Args:
+        map_size: Dimensione della mappa (NxN)
+        obstacle_map: Matrice NxN dove 1 = ostacolo, 0 = libero
+    
+    Returns:
+        dist_lookup: Dizionario {(start_pos, end_pos): distanza}
+                     Se la coppia non esiste, significa che end_pos è irraggiungibile da start_pos
+    """
+    dist_lookup = {}
+    
+    # Direzioni di movimento (escluso 'Stay' perché cerchiamo il percorso più breve)
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # N, S, W, E
+    
+    # Itera su ogni cella libera come punto di partenza
+    for start_r in range(map_size):
+        for start_c in range(map_size):
+            start_pos = (start_r, start_c)
+            
+            # Salta ostacoli
+            if obstacle_map[start_r, start_c] == 1:
+                continue
+            
+            # BFS da questa cella verso tutte le altre
+            queue = deque([(start_pos, 0)])  # (posizione, distanza)
+            visited = {start_pos}
+            
+            while queue:
+                current_pos, dist = queue.popleft()
+                
+                # Salva la distanza nella lookup table
+                dist_lookup[(start_pos, current_pos)] = dist
+                
+                # Esplora i vicini
+                for dr, dc in directions:
+                    next_r = current_pos[0] + dr
+                    next_c = current_pos[1] + dc
+                    next_pos = (next_r, next_c)
+                    
+                    # Verifica limiti della mappa
+                    if not (0 <= next_r < map_size and 0 <= next_c < map_size):
+                        continue
+                    
+                    # Salta ostacoli
+                    if obstacle_map[next_r, next_c] == 1:
+                        continue
+                    
+                    # Salta se già visitato
+                    if next_pos in visited:
+                        continue
+                    
+                    visited.add(next_pos)
+                    queue.append((next_pos, dist + 1))
+    
+    return dist_lookup
+
+
 def check_decision_thresholds(p_map, params):
     if np.any(p_map >= params["threshold_upper"]):
         cell_idx = np.unravel_index(np.argmax(p_map), p_map.shape)
@@ -518,18 +580,27 @@ def check_decision_thresholds(p_map, params):
 
 # --- 3. Logica strategia di movimento ad Asta ---
 
-def calculate_utility_map(p_map, drone_pos, obstacle_map):
-    """Calcola la mappa di utilità U = P/(d+1) per un drone"""
+def calculate_utility_map(p_map, drone_pos, obstacle_map, dist_lookup):
+    """Calcola la mappa di utilità U = P/(d+1) per un drone usando distanze reali (BFS)"""
     grid_w, grid_h = p_map.shape
     
-    # Calcola distanza di Manhattan per ogni cella
-    xx, yy = np.mgrid[0:grid_w, 0:grid_h]
-    distance_map = np.abs(xx - drone_pos[0]) + np.abs(yy - drone_pos[1])
+    # Crea mappa delle distanze usando la lookup table BFS
+    distance_map = np.full((grid_w, grid_h), np.inf)  # Default: infinito (irraggiungibile)
+    
+    for r in range(grid_w):
+        for c in range(grid_h):
+            cell_pos = (r, c)
+            # Cerca distanza nella lookup table
+            dist = dist_lookup.get((tuple(drone_pos), cell_pos))
+            if dist is not None:
+                distance_map[r, c] = dist
+            # Se dist è None, la cella è irraggiungibile (resta infinito)
     
     # Calcola utilità U = P / (d + 1)
+    # Per celle irraggiungibili (d=inf), l'utilità sarà ~0
     utility_map = p_map / (distance_map + 1.0)
     
-    # Azzera utilità per ostacoli
+    # Azzera utilità per ostacoli (già gestiti dalla lookup, ma per sicurezza)
     if obstacle_map is not None:
         utility_map[obstacle_map == 1] = -np.inf
     
@@ -553,7 +624,69 @@ def create_wish_list(utility_map, drone_pos):
     return wish_list
 
 
-def auction_based_planning(p_map, drone_positions, grid_size, obstacle_map=None):
+def get_next_step_bfs(current_pos, target_pos, obstacle_map, dist_lookup, grid_size):
+    """
+    Calcola il prossimo passo ottimale verso il target usando il percorso BFS.
+    
+    Args:
+        current_pos: Posizione corrente del drone (r, c)
+        target_pos: Posizione target (r, c)
+        obstacle_map: Matrice degli ostacoli
+        dist_lookup: Dizionario BFS con distanze precompilate
+        grid_size: (grid_w, grid_h)
+    
+    Returns:
+        next_pos: Prossima posizione ottimale (r, c)
+    """
+    grid_w, grid_h = grid_size
+    current_pos = tuple(current_pos)
+    target_pos = tuple(target_pos)
+    
+    # Se già nella posizione target, resta fermo
+    if current_pos == target_pos:
+        return current_pos
+    
+    # Controlla se il target è raggiungibile
+    if (current_pos, target_pos) not in dist_lookup:
+        # Target irraggiungibile, resta fermo
+        return current_pos
+    
+    # Direzioni possibili: N, S, E, W
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    
+    best_next_pos = current_pos
+    best_distance = float('inf')
+    
+    # Valuta tutte le direzioni adiacenti
+    for dr, dc in directions:
+        next_r = current_pos[0] + dr
+        next_c = current_pos[1] + dc
+        next_pos = (next_r, next_c)
+        
+        # Verifica limiti mappa
+        if not (0 <= next_r < grid_w and 0 <= next_c < grid_h):
+            continue
+        
+        # Salta ostacoli
+        if obstacle_map[next_r, next_c] == 1:
+            continue
+        
+        # Ottieni distanza da next_pos al target dalla lookup table BFS
+        dist_to_target = dist_lookup.get((next_pos, target_pos))
+        
+        # Se la cella è irraggiungibile dal target, skippa
+        if dist_to_target is None:
+            continue
+        
+        # Scegli la direzione con distanza minima al target
+        if dist_to_target < best_distance:
+            best_distance = dist_to_target
+            best_next_pos = next_pos
+    
+    return best_next_pos
+
+
+def auction_based_planning(p_map, drone_positions, grid_size, obstacle_map=None, dist_lookup=None):
     """
     Sistema di asta per assegnare celle target ai droni.
     Ogni drone crea una lista dei desideri e fa offerte iterative.
@@ -564,7 +697,7 @@ def auction_based_planning(p_map, drone_positions, grid_size, obstacle_map=None)
     # 1. Calcola utilità e crea liste dei desideri per ogni drone
     drone_data = []
     for idx, pos in enumerate(drone_positions):
-        utility_map = calculate_utility_map(p_map, pos, obstacle_map)
+        utility_map = calculate_utility_map(p_map, pos, obstacle_map, dist_lookup)
         wish_list = create_wish_list(utility_map, pos)
         drone_data.append({
             'id': idx,
@@ -666,43 +799,22 @@ def auction_based_planning(p_map, drone_positions, grid_size, obstacle_map=None)
                 # Swap detected! Il drone con indice maggiore resta fermo
                 drone_j['assigned_cell'] = drone_j['pos']
     
-    # 5. Calcola le mosse effettive (un passo verso la cella assegnata)
+    # 5. Calcola le mosse effettive (un passo verso la cella assegnata usando BFS)
     final_moves = []
     for drone in drone_data:
         target_cell = drone['assigned_cell']
         current_pos = drone['pos']
         
-        if target_cell == current_pos:
-            # Resta fermo
-            final_moves.append(list(current_pos))
-        else:
-            # Muovi di un passo verso il target
-            dr = np.sign(target_cell[0] - current_pos[0])
-            dc = np.sign(target_cell[1] - current_pos[1])
-            
-            # Priorità alla direzione con distanza maggiore
-            dist_r = abs(target_cell[0] - current_pos[0])
-            dist_c = abs(target_cell[1] - current_pos[1])
-            
-            if dist_r >= dist_c and dr != 0:
-                # Muovi verticalmente
-                next_pos = (current_pos[0] + dr, current_pos[1])
-            elif dc != 0:
-                # Muovi orizzontalmente
-                next_pos = (current_pos[0], current_pos[1] + dc)
-            else:
-                # Già nella posizione target
-                next_pos = current_pos
-            
-            # Verifica che la mossa sia valida
-            if (0 <= next_pos[0] < grid_w and 0 <= next_pos[1] < grid_h):
-                # Controlla ostacoli
-                if obstacle_map is not None and obstacle_map[next_pos[0], next_pos[1]] == 1:
-                    next_pos = current_pos  # Resta fermo se c'è un ostacolo
-                
-                final_moves.append(list(next_pos))
-            else:
-                final_moves.append(list(current_pos))
+        # Usa BFS per trovare il prossimo passo ottimale verso il target
+        next_pos = get_next_step_bfs(
+            current_pos, 
+            target_cell, 
+            obstacle_map if obstacle_map is not None else np.zeros((grid_w, grid_h), dtype=int),
+            dist_lookup,
+            (grid_w, grid_h)
+        )
+        
+        final_moves.append(list(next_pos))
     
     # 6. Verifica collisioni nella mossa finale
     # Se due droni vanno nella stessa cella, quello con indice minore ha priorità
@@ -889,6 +1001,14 @@ def run_simulation(params):
         for obs_pos in params['obstacles']:
             r, c = obs_pos
             obstacle_map[r, c] = 1
+    else:
+        # Crea obstacle_map vuota se non ci sono ostacoli
+        obstacle_map = np.zeros((grid_w, grid_h), dtype=int)
+    
+    # Pre-calcola tutte le distanze tra celle usando BFS (considera ostacoli)
+    print("Pre-calcolo distanze tra celle (BFS)...")
+    dist_lookup = precompute_all_pairs_distances(grid_w, obstacle_map)
+    print(f"✓ Calcolate {len(dist_lookup)} coppie di distanze")
     
     max_prob = p_map.max()
     simulation_started = False
@@ -924,7 +1044,8 @@ def run_simulation(params):
                     p_map,
                     drone_positions,
                     params["grid_size"],
-                    obstacle_map=obstacle_map
+                    obstacle_map=obstacle_map,
+                    dist_lookup=dist_lookup
                 )
 
                 for idx, new_pos in enumerate(new_positions):
