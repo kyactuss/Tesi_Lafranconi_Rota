@@ -17,14 +17,13 @@ DEFAULT_CONFIG = {
     'map_size': 20,
     'real_alpha': 0.01,
     'real_beta': 0.01,
-    'max_iterations': 1000000,
-    'max_time': 3.5,
-    'depth_limit': 100,
-    'discount_factor': 0.9,
+    'max_iterations': 500000,
+    'max_time': 2.5,
+    'depth_limit': 50,
+    'discount_factor': 0.92,
     'exploration_const': math.sqrt(2),
-    'reward_alpha': 3,
-    'penalty_w': 1,
-    'penalty_coeff': 0.1,
+    'reward_alpha': 10,
+    'penalty_w': 0.13,
 }
 
 def get_user_parameters():
@@ -739,7 +738,7 @@ class POMCPSolver:
     def __init__(self, max_iterations=None, max_time=None, depth_limit=None, discount_factor=None,
                  exploration_const=None, sensor_alpha=None, sensor_beta=None,
                  reward_alpha=None, map_size=None, obstacle_map=None,
-                 penalty_w=None, penalty_coeff=None, drone_id=None):
+                 penalty_w=None, drone_id=None):
         cfg = DEFAULT_CONFIG
         self.max_iterations = max_iterations if max_iterations is not None else cfg['max_iterations']
         self.max_time = max_time if max_time is not None else cfg['max_time']
@@ -755,9 +754,8 @@ class POMCPSolver:
         self.total_nodes_created = 0  # Contatore nodi creati durante search
         self.max_depth_reached = 0    # Profondità massima raggiunta
         
-        # Parametri per nuova formula penalty: total_reward = base_reward - penalty_coeff * penalty
+        # Parametri per nuova formula penalty: total_reward = base_reward - penalty
         self.penalty_w = penalty_w if penalty_w is not None else cfg['penalty_w']
-        self.penalty_coeff = penalty_coeff if penalty_coeff is not None else cfg['penalty_coeff']
         
         # ID del drone per gestire priorità asimmetrica nella penalty
         self.drone_id = drone_id
@@ -1040,8 +1038,8 @@ class POMCPSolver:
         # Applica il fattore (w/2) alla somma delle penalty
         penalty = (self.penalty_w / 2.0) * penalty
         
-        # Reward finale: total_reward = base_reward - coefficiente * penalty
-        total_reward = base_reward - self.penalty_coeff * penalty
+        # Reward finale: total_reward = base_reward - penalty
+        total_reward = base_reward - penalty
 
         return next_state, obs, total_reward, terminal
 
@@ -1272,7 +1270,6 @@ def worker_pomcp_task(args):
         map_size=params['map_size'],
         obstacle_map=obstacle_map,
         penalty_w=params.get('penalty_w'),
-        penalty_coeff=params.get('penalty_coeff'),
         drone_id=drone_id
     )
     
@@ -1321,8 +1318,7 @@ class DroneAgent:
             sensor_alpha=params['real_alpha'], 
             sensor_beta=params['real_beta'],
             obstacle_map=self.obstacle_map,
-            penalty_w=params.get('penalty_w'),
-            penalty_coeff=params.get('penalty_coeff')
+            penalty_w=params.get('penalty_w')
         )
 
         # Stato interno decisionale
@@ -1544,9 +1540,13 @@ def draw_static_background(surface, p_map, font_cell, params):
                 color = RED
             else:
                 # Heatmap: blu più scuro = probabilità più alta
+                # Usa mappatura non lineare (potenza 0.4) per gradazione più graduale
                 color_val = 0
                 if max_prob > 1e-9:
-                    color_val = int(255 * (prob / max_prob))
+                    normalized_prob = prob / max_prob
+                    # Applica funzione potenza per rendere la scala più graduale
+                    # Esponente < 1 comprime la differenza tra valori alti
+                    color_val = int(255 * (normalized_prob ** 0.4))
                 color = (max(0, 255 - color_val), max(0, 255 - color_val), 255)
 
             # In Pygame: x = colonna (c), y = riga (r)
