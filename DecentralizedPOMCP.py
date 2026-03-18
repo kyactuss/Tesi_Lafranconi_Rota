@@ -12,14 +12,15 @@ from collections import deque
 # =============================================================================
 DEFAULT_CONFIG = {
     'map_size': 20,
-    'alpha_sensor': 0.01,
-    'beta_sensor': 0.01,
+    'alpha_sensor': 0.0,
+    'beta_sensor': 0.0,
     'max_time': 2.5,
     'depth_limit': 50,
-    'discount_factor': 0.92,
-    'exploration_const': 25, #math.sqrt(2)
-    'reward_alpha': 100,
-    'penalty_w': 0.01,
+    'discount_factor': 0.95,
+    'exploration_const': math.sqrt(2),
+    'reward_alpha': 10,
+    'penalty_w': 0.05,
+    'r_target': 1,
 }
 
 # Movements related to actions, used for position updates
@@ -119,6 +120,12 @@ def get_user_parameters():
         else:
             peaks_positions = []
         
+        # Extract only the spatial coordinates of traces
+        if 'traces' in context_items and context_items['traces']:
+            traces_positions = [trace['pos'] for trace in context_items['traces']]
+        else:
+            traces_positions = []
+        
         # Title and instructions
         title_text = font_title.render(f"PHASE: {phase_name}", True, phase_color)
         info_text = font_info.render("Click on grid to select cells", True, COLORS['BLACK'])
@@ -154,6 +161,11 @@ def get_user_parameters():
                 elif (r, c) in peaks_positions:
                     cell_color = COLORS['PURPLE']
                     label = "G"
+                    text_color = COLORS['WHITE']
+                # Check if it's an already placed trace
+                elif (r, c) in traces_positions:
+                    cell_color = COLORS['ORANGE']
+                    label = "Tr"
                     text_color = COLORS['WHITE']
                 # Check if it's an already placed obstacle
                 elif 'obstacles' in context_items and (r, c) in context_items['obstacles']:
@@ -242,17 +254,17 @@ def get_user_parameters():
     dictionary_context={}
 
     # PHASE 1: Drone positions selection
-    print("\n[1/5] Select DRONES positions ")
+    print("\n[1/6] Select DRONES positions ")
     dictionary_context['drones'] = interactive_selection("1. DRONES Positions", COLORS['BLUE'], allow_multiple=True)
     print(f"✓ {len(dictionary_context['drones'])} drones configured")
     
     # PHASE 2: Target position selection
-    print("\n[2/5] Select TARGET position ")
+    print("\n[2/6] Select TARGET position ")
     dictionary_context['target'] = interactive_selection("2. TARGET Position", COLORS['RED'], allow_multiple=False, context_items=dictionary_context)[0]
     print(f"✓ Target at position {dictionary_context['target']}")
     
     # PHASE 3: Initial belief map type selection
-    print("\n[3/5] Choose initial belief map type")
+    print("\n[3/6] Choose initial belief map type")
 
     screen.fill(COLORS['WHITE'])
     title = font_title.render("Initial Belief Map Type", True, COLORS['BLACK'])
@@ -294,7 +306,7 @@ def get_user_parameters():
     
     # PHASE 4: Probability peaks selection (if not uniform)
     if dictionary_context['map_type'] == 2:
-        print("\n[4/5] Select GAUSSIAN centers (minimum 1, multiple clicks + ENTER)")
+        print("\n[4/6] Select GAUSSIAN centers (minimum 1, multiple clicks + ENTER)")
         
         # For each peak, ask for sigma (via terminal)
         for i, center in enumerate(interactive_selection("4. GAUSSIAN Centers", COLORS['PURPLE'], allow_multiple=True, context_items=dictionary_context)):
@@ -316,11 +328,92 @@ def get_user_parameters():
         
         print(f"✓ {len(dictionary_context['peaks'])} Gaussian peaks configured")
     else:
-        print("\n[4/5] No Gaussian peak needed (uniform map)")
+        print("\n[4/6] No Gaussian peak needed (uniform map)")
     
-    # PHASE 5: Obstacles position selection
-    print("\n[5/5] Select OBSTACLES positions (multiple clicks + ENTER, or just ENTER for none)")   
-    dictionary_context['obstacles'] = interactive_selection("5. OBSTACLES Positions", COLORS['BLACK'], allow_multiple=True, context_items=dictionary_context, validate_cell=True, allow_empty=True)
+    # PHASE 5: Traces position selection
+    print("\n[5/6] Select TRACES positions (multiple clicks + ENTER, or just ENTER for none)")
+    selected_traces_coords = interactive_selection("5. TRACES Positions", COLORS['ORANGE'], allow_multiple=True, context_items=dictionary_context, validate_cell=True, allow_empty=True)
+    
+    dictionary_context['traces'] = []
+    
+    # For each selected trace position, ask for type and parameters
+    for i, coord in enumerate(selected_traces_coords):
+        print(f"\n  Trace #{i+1} at position {coord}")
+        print("  Select trace type:")
+        print("    1 - Von Mises")
+        print("    2 - Ring")
+        print("    3 - Gaussian")
+        
+        while True:
+            try:
+                trace_type_input = input("  Enter choice (1/2/3): ").strip()
+                if trace_type_input in ['1', '2', '3']:
+                    break
+                print("  Invalid choice. Please enter 1, 2, or 3.")
+            except ValueError:
+                print("  Invalid input.")
+        
+        # Collect parameters based on trace type
+        if trace_type_input == '1':  # Von Mises
+            while True:
+                try:
+                    mu_deg = float(input("  Enter direction μ (in degrees): "))
+                    kappa = float(input("  Enter concentration κ: "))
+                    if kappa >= 0:
+                        break
+                    print("  Concentration must be non-negative.")
+                except ValueError:
+                    print("  Invalid format. Please enter valid numbers.")
+
+            mu = math.radians(mu_deg) # Convert direction to radians for internal use
+            
+            trace_dict = {
+                'pos': coord,
+                'type': 'von_mises',
+                'trace_params': {'mu': mu, 'kappa': kappa}
+            }
+        
+        elif trace_type_input == '2':  # Ring
+            while True:
+                try:
+                    radius = float(input("  Enter radius: "))
+                    variance = float(input("  Enter variance: "))
+                    if radius > 0 and variance > 0:
+                        break
+                    print("  Radius and variance must be positive.")
+                except ValueError:
+                    print("  Invalid format. Please enter valid numbers.")
+            
+            trace_dict = {
+                'pos': coord,
+                'type': 'ring',
+                'trace_params': {'radius': radius, 'variance': variance}
+            }
+        
+        elif trace_type_input == '3':  # Gaussian
+            while True:
+                try:
+                    sigmas = input("  Enter Sigma_X, Sigma_Y (e.g., 2.0,2.0): ")
+                    sigma_x, sigma_y = map(float, sigmas.split(','))
+                    if sigma_x > 0 and sigma_y > 0:
+                        break
+                    print("  Standard deviations must be positive.")
+                except ValueError:
+                    print("  Invalid format. Use: number,number")
+            
+            trace_dict = {
+                'pos': coord,
+                'type': 'gaussian',
+                'trace_params': {'sigma_x': sigma_x, 'sigma_y': sigma_y}
+            }
+        
+        dictionary_context['traces'].append(trace_dict)
+    
+    print(f"✓ {len(dictionary_context['traces'])} traces configured")
+    
+    # PHASE 6: Obstacles position selection
+    print("\n[6/6] Select OBSTACLES positions (multiple clicks + ENTER, or just ENTER for none)")   
+    dictionary_context['obstacles'] = interactive_selection("6. OBSTACLES Positions", COLORS['BLACK'], allow_multiple=True, context_items=dictionary_context, validate_cell=True, allow_empty=True)
     print(f"✓ {len(dictionary_context['obstacles'])} obstacles configured")
 
     # Close pygame window
@@ -343,11 +436,13 @@ def get_user_parameters():
         'exploration_const': DEFAULT_CONFIG['exploration_const'],
         'reward_alpha': DEFAULT_CONFIG['reward_alpha'],
         'penalty_w': DEFAULT_CONFIG['penalty_w'],
+        'r_target': DEFAULT_CONFIG['r_target'],
         'num_drones': len(dictionary_context['drones']),
         'drone_positions': dictionary_context['drones'],
         'target_pos': dictionary_context['target'],
         'map_type': dictionary_context['map_type'],
         'peaks': dictionary_context['peaks'],
+        'traces': dictionary_context['traces'],
         'obstacles': dictionary_context['obstacles']
     }
     
@@ -496,7 +591,7 @@ class POMCPNode:
         return self.total_node_visits == 0
 
 class POMCPSolver:
-    def __init__(self, max_time, depth_limit, discount_factor, exploration_const, sensor_alpha, sensor_beta, reward_alpha, map_size, obstacle_map, penalty_w, drone_id, dist_BFS):
+    def __init__(self, max_time, depth_limit, discount_factor, exploration_const, sensor_alpha, sensor_beta, reward_alpha, map_size, obstacle_map, penalty_w, drone_id, dist_BFS, r_target):
     
         # Save configuration parameters as class attributes
         self.max_time = max_time
@@ -510,6 +605,7 @@ class POMCPSolver:
         self.obstacle_map = obstacle_map
         self.penalty_w = penalty_w
         self.drone_id = drone_id
+        self.r_target = r_target
         
         # Use precomputed BFS distances (optimization)
         self.dist_BFS = dist_BFS
@@ -670,7 +766,7 @@ class POMCPSolver:
             return 0.0  # Minimum reward for unreachable target
         
         # Formula for a decreasing reward with BFS distance
-        score = 1 * (self.gamma ** dist)
+        score = (0.75 ** dist)
         return score
 
     # Black box simulator: state transition (drone movement), observation, reward
@@ -693,17 +789,17 @@ class POMCPSolver:
 
         # Base reward calculation: R_base = R_target + reward_alpha * R_token 
         if (next_drone == target_pos) and obs == 1:
-            r_target = 100.0          # Maximum reward for finding the target
+            r_target_reward = self.r_target          # Maximum reward for finding the target
             terminal = True     
         else:
-            r_target = 0.0          # No reward if target was not found 
+            r_target_reward = 0.0          # No reward if target was not found 
 
         if next_drone not in visited_cells:
             r_token = belief_map[next_drone]        # Additional reward for exploring new cells, proportional to probability that target is in that cell according to belief map
         else:
             r_token = 0.0                           # No reward for already visited cells
 
-        base_reward = r_target + (self.reward_alpha * r_token)
+        base_reward = r_target_reward + (self.reward_alpha * r_token)
 
         visited_cells.add(next_drone)
         
@@ -732,14 +828,13 @@ class POMCPSolver:
                     
                     # Calculate d^2 (squared distance)
                     d_manhattan_squared = dist_manhattan ** 2
-                    
-                    # Avoid division by zero: if drones are in same position
+
+
                     if d_manhattan_squared == 0:
-                        penalty += 100          # Maximum penalty for overlap, implicitly avoids collisions
+                        penalty += 100.0 * (0.01 ** depth)
                     else:
-                        penalty += 1.0 / d_manhattan_squared
-        
-        penalty = (self.penalty_w / 2.0) * penalty
+                        penalty += (self.penalty_w) * (1.0 / d_manhattan_squared)
+  
         
         # Final reward: total_reward = base_reward - penalty
         total_reward = base_reward - penalty
@@ -943,7 +1038,8 @@ def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_pla
         obstacle_map=obstacle_map,
         penalty_w=params['penalty_w'],
         drone_id=drone_id,
-        dist_BFS=params['dist_BFS']
+        dist_BFS=params['dist_BFS'],
+        r_target=params['r_target']
     )
     
     # Execute POMCP search with provided data
@@ -986,7 +1082,8 @@ class DroneAgent:
             obstacle_map=self.obstacle_map,
             penalty_w=params['penalty_w'],
             drone_id=self.id,
-            dist_BFS=params['dist_BFS']
+            dist_BFS=params['dist_BFS'],
+            r_target=params['r_target']
         )
 
         self.planned_result = None      # Dictionary to store POMCP result (best_action, future_plans, depth, visits, nodes_created)
@@ -1000,6 +1097,8 @@ class DroneAgent:
         self.partner_final_actions = {}     # Dictionary to store intentions (best_action) received from partners
         self.partner_future_plans = {}      # Dictionary to store partner future plans received
         self.partner_observations = {}      # Dictionary to store observations received from partners
+        
+        self.discovered_traces = set()      # Set to track already discovered traces (by position) to avoid reprocessing
 
 
     # Method that simulates sending own movement intention to companion
@@ -1072,16 +1171,30 @@ class DroneAgent:
         self.pos = (self.pos[0] + d[0], self.pos[1] + d[1])
 
 
-    # Simulate real drone sensor observation and update belief map
-    def get_real_observation(self, target_pos):
-
-        if (self.pos == target_pos):
-            obs = 0 if np.random.rand() < self.params['beta_sensor'] else 1
-        else:
-            obs = 1 if np.random.rand() < self.params['alpha_sensor'] else 0
+    # Simulate real drone sensor observation, with trace detection logic and target detection logic
+    def get_real_observation(self, target_pos, traces):
         
-        self.observation = obs  # Save observation in attribute
-        self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, self.pos, self.observation)       # Update own belief map with own observation
+        # Check if current position has a trace that hasn't been discovered yet
+        trace_found = None
+        for trace in traces:
+            if trace['pos'] == self.pos and self.pos not in self.discovered_traces:
+                trace_found = trace
+                break
+        
+        if trace_found:
+            # Trace detection logic (only False Negative, no False Positive)
+            if np.random.rand() < self.params['beta_sensor']:
+                self.observation = 0    # False Negative: trace is present but not detected
+            else:
+                self.observation = trace_found  # Trace is detected, save trace information in observation attribute
+        else:
+            # Target detection logic (or normal observation on already-discovered trace cell)
+            if (self.pos == target_pos):
+                obs = 0 if np.random.rand() < self.params['beta_sensor'] else 1
+            else:
+                obs = 1 if np.random.rand() < self.params['alpha_sensor'] else 0
+            
+            self.observation = obs
 
 
     # Method that simulates sending own observation and future plan to partners
@@ -1098,7 +1211,7 @@ class DroneAgent:
         }
     
 
-    # Method that simulates receiving observation and future plan from partner, updating stored information and belief map
+    # Method that simulates receiving observation and future plan from partner, storing information in internal registers
     def receive_remote_observation(self, drone_id, position, observation, future_plan):
         
         # Save partner position, observation and future plan
@@ -1106,8 +1219,129 @@ class DroneAgent:
         self.partner_observations[drone_id] = observation
         self.partner_future_plans[drone_id] = future_plan
         
-        self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, self.partner_positions[drone_id], self.partner_observations[drone_id])       # Update belief map with partner observation
 
+    # Method to apply trace distribution to belief map using Decentralized Data Fusion
+    def apply_trace_distribution(self, trace_obs):
+        
+        trace_type = trace_obs['type']
+        trace_pos = trace_obs['pos']
+        trace_params = trace_obs['trace_params']
+        map_size = self.params['map_size']
+        
+        # Create grid of coordinates and calculate deltas from trace position
+        r, c = np.indices((map_size, map_size)) 
+        delta_r = r - trace_pos[0]
+        delta_c = c - trace_pos[1]
+
+        # Generate distribution based on trace type
+        if trace_type == 'von_mises':
+            mu = trace_params['mu']             # Direction in radians
+            kappa = trace_params['kappa']       # Concentration parameter
+            
+            # Calculate angles from trace position to each cell
+            angles = np.arctan2(delta_r, delta_c)
+
+            # Calculate von Mises distribution values for each cell
+            diff = angles - mu
+            trace_distribution = np.exp(kappa * np.cos(diff)) / (2 * np.pi * np.i0(kappa))
+
+            # Set distribution value to 1 at the trace position cell (maximum likelihood)
+            trace_distribution[trace_pos[0], trace_pos[1]] = 1.0
+        
+        elif trace_type == 'ring':
+            radius = trace_params['radius']      # Radius of the ring
+            variance = trace_params['variance']  # Variance of the ring
+            
+            # Calculate distance from trace position for each cell
+            dist_matrix = np.sqrt(delta_r**2 + delta_c**2)
+
+            # Calculate ring-shaped distribution values for each cell
+            trace_distribution = np.exp(-((dist_matrix - radius)**2) / (2 * variance))
+        
+        elif trace_type == 'gaussian':
+            sigma_x = trace_params['sigma_x']   # Standard deviation in x direction
+            sigma_y = trace_params['sigma_y']   # Standard deviation in y direction
+            
+            # Create grid coordinates
+            x, y = np.mgrid[0:map_size, 0:map_size]
+            coord = np.dstack((x, y))
+            
+            # Covariance matrix
+            cov_matrix = [[sigma_x**2, 0], [0, sigma_y**2]]
+            
+            # Create multivariate normal distribution
+            rv = multivariate_normal(trace_pos, cov_matrix)
+            trace_distribution = rv.pdf(coord)
+        
+
+        # Combines independent likelihood from trace with current belief
+        fused_belief = self.belief_map * trace_distribution     # Hadamard product (element-wise multiplication)
+        fused_belief = fused_belief * (1 - self.obstacle_map)   # Apply obstacles (zero probability in obstacle cells)
+        total_prob = np.sum(fused_belief)       # Normalization 
+
+        if total_prob > 1e-9:
+            fused_belief /= total_prob
+        else:
+            # Fallback: keep previous belief unchanged (skip trace update)
+            fused_belief = self.belief_map.copy()
+        
+        return fused_belief
+
+
+    # Method to update belief map from all observations (own and partners), processing traces first then standard Bayesian updates
+    def update_belief_from_all_obs(self):
+        
+        # Collect and unify all observations from this turn
+        all_observations = []
+        
+        all_observations.append((self.pos, self.observation))   # Add own observation
+        for partner_id, partner_obs in self.partner_observations.items():   # Add partners' observations
+            partner_pos = self.partner_positions[partner_id]
+            all_observations.append((partner_pos, partner_obs))
+        
+        # Process all observations: traces (if not already discovered) or standard Bayesian updates
+        for pos, obs in all_observations:
+            if isinstance(obs, dict) and 'type' in obs and 'pos' in obs:    # Check if observation is a trace
+                if pos not in self.discovered_traces:       # Check if this trace was already discovered in a previous turn
+                    self.belief_map = self.apply_trace_distribution(obs)
+                    self.discovered_traces.add(pos)
+                    print(f"  [D{self.id}] New trace discovered at {pos} of type '{obs['type']}'")
+                else:
+                    print(f"  [D{self.id}] Trace at {pos} already processed, skipping")
+            elif isinstance(obs, int) and obs in [0, 1]:    # Standard Bayesian update for non-trace observations
+                self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, pos, obs)
+        
+        # Clean buffers for next turn
+        self.partner_observations.clear()
+        self.observation = None
+
+
+    # Method to adapt POMCP parameters based on current characteristics of the mission
+    def adapt_pomcp_parameters(self, num_drones):
+        
+        max_belief = max(1e-9, np.max(self.belief_map))
+
+        '''
+        uncertainty = 1.0 - max_belief
+        
+        self.params['reward_alpha'] = 6 * (1.0 + uncertainty)
+        '''
+
+        map_size = self.params['map_size']
+        r, c = self.pos
+        neighborhood_probs = []
+        for dr, dc in [(0,0), (-1,0), (1,0), (0,-1), (0,1)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < map_size and 0 <= nc < map_size and self.obstacle_map[nr, nc] == 0:
+                neighborhood_probs.append(self.belief_map[nr, nc])
+                
+        local_belief = max(neighborhood_probs) if neighborhood_probs else 1e-9
+        
+        relevance = local_belief / max_belief
+        
+        base_w = 0.5 * (4.0 / max(1, num_drones))
+        #self.params['penalty_w'] = base_w * relevance
+        
 
 # =============================================================================
 # 4. GRAPHIC FUNCTIONS 
@@ -1152,8 +1386,8 @@ def draw_static_background(graphics_ctx, belief_map):
                 surface.blit(text, text_rect)
 
 
-# Draw dynamic elements: drones, target and sidebar with statistics
-def draw_elements(graphics_ctx, drones, target_pos, stats):
+# Draw dynamic elements: drones, target, traces and sidebar with statistics
+def draw_elements(graphics_ctx, drones, target_pos, traces, stats):
     
     screen = graphics_ctx['screen']
     CELL_SIZE = graphics_ctx['CELL_SIZE']
@@ -1170,6 +1404,16 @@ def draw_elements(graphics_ctx, drones, target_pos, stats):
     target_rect = pygame.Rect(ty * CELL_SIZE, tx * CELL_SIZE, CELL_SIZE, CELL_SIZE)
     pygame.draw.line(screen, COLORS['RED'], target_rect.topleft, target_rect.bottomright, 3)
     pygame.draw.line(screen, COLORS['RED'], target_rect.topright, target_rect.bottomleft, 3)
+
+    # Traces
+    for trace in traces:
+        trace_r, trace_c = trace['pos']
+        trace_square = pygame.Rect(trace_c * CELL_SIZE + CELL_SIZE // 4, trace_r * CELL_SIZE + CELL_SIZE // 4, CELL_SIZE // 2, CELL_SIZE // 2)
+        pygame.draw.rect(screen, COLORS['ORANGE'], trace_square, 0)  # Filled square
+        
+        center = (trace_c * CELL_SIZE + CELL_SIZE // 2, trace_r * CELL_SIZE + CELL_SIZE // 2)
+        trace_label = font_cell.render("Tr", True, COLORS['WHITE'])
+        screen.blit(trace_label, trace_label.get_rect(center=center))
 
     # Drones
     drone_colors = list(COLORS.values())[8:]
@@ -1276,14 +1520,14 @@ def init_graphics(params):
 
 
 # Complete frame rendering
-def render_frame(graphics_ctx, drones, target_pos, ui_stats):
+def render_frame(graphics_ctx, drones, target_pos, traces, ui_stats):
     
     draw_static_background(graphics_ctx, drones[0].belief_map)
     
     graphics_ctx['screen'].fill(COLORS['WHITE'])
     graphics_ctx['screen'].blit(graphics_ctx['background_surface'], (0, 0))
     
-    draw_elements(graphics_ctx, drones, target_pos, ui_stats)
+    draw_elements(graphics_ctx, drones, target_pos, traces, ui_stats)
     
     pygame.display.flip()
 
@@ -1300,6 +1544,10 @@ def run_simulation(params):
     num_drones = params['num_drones']
     target_pos = params['target_pos']
     drone_positions_list = params['drone_positions']
+    traces = params['traces']
+    
+    # Create drone parameters without environment secrets (target position and traces)
+    drone_params = {k: v for k, v in params.items() if k not in ['target_pos', 'traces']}
     
     # DRONE AGENTS AND SIDEBAR STATISTICS INITIALIZATION
     drones = []
@@ -1307,7 +1555,7 @@ def run_simulation(params):
 
         # Calculate partner positions and pass them to drone constructor
         partner_pos = {j + 1: drone_positions_list[j] for j in range(num_drones) if j != i}
-        drone = DroneAgent(i + 1, drone_positions_list[i], params, partner_pos)
+        drone = DroneAgent(i + 1, drone_positions_list[i], drone_params, partner_pos)
         drones.append(drone)
     
     # Sidebar statistics initialized
@@ -1340,6 +1588,14 @@ def run_simulation(params):
 
                 step_counter += 1
                 print(f"\n--- STEP {step_counter} ---")
+
+                
+                
+                # ADAPT POMCP PARAMETERS FOR EACH DRONE BASED ON CURRENT STATE
+                for drone in drones:
+                    drone.adapt_pomcp_parameters(num_drones)
+                
+                
 
                 # PARALLEL PLANNING (POMCP for each drone)
                 tasks = []
@@ -1382,7 +1638,7 @@ def run_simulation(params):
 
                 # PERCEPTION
                 for drone in drones:
-                    drone.get_real_observation(target_pos)
+                    drone.get_real_observation(target_pos, traces)
                 
                 observation_packets = [drone.send_observation_and_future_plan() for drone in drones]
                 
@@ -1390,9 +1646,11 @@ def run_simulation(params):
                 for drone in drones:
                     for pkt in observation_packets:
                         if pkt['id'] != drone.id:
-                            drone.receive_remote_observation(
-                                pkt['id'], pkt['pos'], pkt['observation'], pkt['future_plan']
-                            )
+                            drone.receive_remote_observation(pkt['id'], pkt['pos'], pkt['observation'], pkt['future_plan'])
+                
+                # BELIEF UPDATE
+                for drone in drones:
+                    drone.update_belief_from_all_obs()
 
                 # Update statistics for each drone to show in sidebar
                 ui_stats['step'] = step_counter
@@ -1414,7 +1672,7 @@ def run_simulation(params):
                     print("\n TARGET TROVATO! (probabilità > 95%)")
                     auto_mode = False
                 
-            render_frame(graphics_ctx, drones, target_pos, ui_stats)
+            render_frame(graphics_ctx, drones, target_pos, traces, ui_stats)
             graphics_ctx['clock'].tick(30)
             
             # User input handling 
