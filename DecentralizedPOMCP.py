@@ -15,11 +15,11 @@ DEFAULT_CONFIG = {
     'alpha_sensor': 0.0,
     'beta_sensor': 0.0,
     'max_time': 2.5,
-    'depth_limit': 50,
+    'depth_limit': 1000,
     'discount_factor': 0.95,
     'exploration_const': math.sqrt(2),
-    'reward_alpha': 10,
-    'penalty_w': 0.05,
+    'reward_alpha': 1,
+    'explorative_reward': 0.0025,
     'r_target': 1,
 }
 
@@ -435,7 +435,7 @@ def get_user_parameters():
         'discount_factor': DEFAULT_CONFIG['discount_factor'],
         'exploration_const': DEFAULT_CONFIG['exploration_const'],
         'reward_alpha': DEFAULT_CONFIG['reward_alpha'],
-        'penalty_w': DEFAULT_CONFIG['penalty_w'],
+        'explorative_reward': DEFAULT_CONFIG['explorative_reward'],
         'r_target': DEFAULT_CONFIG['r_target'],
         'num_drones': len(dictionary_context['drones']),
         'drone_positions': dictionary_context['drones'],
@@ -591,7 +591,7 @@ class POMCPNode:
         return self.total_node_visits == 0
 
 class POMCPSolver:
-    def __init__(self, max_time, depth_limit, discount_factor, exploration_const, sensor_alpha, sensor_beta, reward_alpha, map_size, obstacle_map, penalty_w, drone_id, dist_BFS, r_target):
+    def __init__(self, max_time, depth_limit, discount_factor, exploration_const, sensor_alpha, sensor_beta, reward_alpha, explorative_reward, map_size, obstacle_map, drone_id, dist_BFS, r_target, explored_cells):
     
         # Save configuration parameters as class attributes
         self.max_time = max_time
@@ -601,11 +601,12 @@ class POMCPSolver:
         self.sensor_alpha = sensor_alpha
         self.sensor_beta = sensor_beta
         self.reward_alpha = reward_alpha
+        self.explorative_reward = explorative_reward
         self.map_size = map_size
         self.obstacle_map = obstacle_map
-        self.penalty_w = penalty_w
         self.drone_id = drone_id
         self.r_target = r_target
+        self.explored_cells = set(explored_cells)
         
         # Use precomputed BFS distances (optimization)
         self.dist_BFS = dist_BFS
@@ -624,9 +625,6 @@ class POMCPSolver:
         # Creation of root node with current belief map
         root = POMCPNode(belief_map=current_belief_map, parent=None)
         self.root = root 
-
-        # Calculate drones to ignore in penalty
-        self.ignored_penalty_drones = self._compute_ignored_penalty_drones()
         
         start_time = time.time()    # Start timer for POMCP time limit
         
@@ -641,7 +639,7 @@ class POMCPSolver:
             state = (sampled_target_pos, self.drone_position)
             
             # Start recursive simulation 
-            self.simulate(state, root, 0, visited_cells=None)
+            self.simulate(state, root, 0, visited_cells=None, current_visited_cells=self.explored_cells)
         
         # Selection of best action
         best_action = self._select_best_action(root)
@@ -658,13 +656,15 @@ class POMCPSolver:
         return best_action, future_plans
 
     # Recursive simulation function (executes expansion, rollout and backpropagation)
-    def simulate(self, state, node, depth, visited_cells=None): 
+    def simulate(self, state, node, depth, visited_cells=None, current_visited_cells=None): 
         
         # Initialize the set at root for visited_cells
         if visited_cells is None:
             visited_cells = set()
         else:
             visited_cells = visited_cells.copy() # If it already exists, make a copy
+
+        current_visited_cells = current_visited_cells.copy()
 
         # Update maximum depth reached for monitoring and statistics
         if depth > self.max_depth_reached:
@@ -692,7 +692,7 @@ class POMCPSolver:
         action = self._ucb_search(node)
 
         # Generative Model (G): simulation of state transition, observation and reward
-        next_state, observation, reward, terminal = self.generative_model_G(state, action, node.belief_map, visited_cells, depth)
+        next_state, observation, reward, terminal = self.generative_model_G(state, action, node.belief_map, visited_cells, current_visited_cells, depth)
 
         # Tree descent: check if child node exists 
         if (action, observation) in node.children:
@@ -710,7 +710,7 @@ class POMCPSolver:
         if terminal:
             future_reward = 0.0
         else:
-            future_reward = self.simulate(next_state, child_node, depth + 1, visited_cells)
+            future_reward = self.simulate(next_state, child_node, depth + 1, visited_cells, current_visited_cells)
 
         q_value = reward + self.gamma * future_reward
 
@@ -770,7 +770,7 @@ class POMCPSolver:
         return score
 
     # Black box simulator: state transition (drone movement), observation, reward
-    def generative_model_G(self, state, action, belief_map, visited_cells, depth=0):
+    def generative_model_G(self, state, action, belief_map, visited_cells, current_visited_cells, depth=0):
         
         target_pos, drone_pos = state 
         
@@ -801,43 +801,12 @@ class POMCPSolver:
 
         base_reward = r_target_reward + (self.reward_alpha * r_token)
 
+        explorative_bonus = self.explorative_reward if next_drone not in current_visited_cells else 0.0
+
         visited_cells.add(next_drone)
-        
-        # Repulsive penalty calculation: penalty = (w/2) * SUM{1/(d^2)}
-        penalty = 0.0
-        
-        if self.partner_plans is not None and self.partner_positions is not None:
-            for partner_id, future_plan in self.partner_plans.items():
-                # Ignore penalty for drones with higher ID and close (Manhattan <= 2) to current drone position
-                if self.ignored_penalty_drones is not None and partner_id in self.ignored_penalty_drones:
-                    continue  
-                
-                # Check if partner has a defined future plan for this time step (depth)
-                if depth < len(future_plan):
+        current_visited_cells.add(next_drone)
 
-                    # Calculate partner position at this depth 
-                    next_partner_pos = self.partner_positions[partner_id]
-                    
-                    # Apply future plan moves up to current depth, simulating partner movements present in future plan
-                    for i in range(depth + 1):
-                        delta_partner = MOVES_DELTA.get(future_plan[i], (0, 0))
-                        next_partner_pos = (next_partner_pos[0] + delta_partner[0], next_partner_pos[1] + delta_partner[1])
-                    
-                    # Calculate MANHATTAN distance between next_drone and next_partner_pos
-                    dist_manhattan = (abs(next_drone[0] - next_partner_pos[0]) + abs(next_drone[1] - next_partner_pos[1]))
-                    
-                    # Calculate d^2 (squared distance)
-                    d_manhattan_squared = dist_manhattan ** 2
-
-
-                    if d_manhattan_squared == 0:
-                        penalty += 100.0 * (0.01 ** depth)
-                    else:
-                        penalty += (self.penalty_w) * (1.0 / d_manhattan_squared)
-  
-        
-        # Final reward: total_reward = base_reward - penalty
-        total_reward = base_reward - penalty
+        total_reward = base_reward + explorative_bonus
 
         return next_state, obs, total_reward, terminal
 
@@ -946,23 +915,6 @@ class POMCPSolver:
         
         return best_action
 
-    # Method to calculate nearby partners (Manhattan distance <= 2) and with higher ID to ignore in penalty
-    def _compute_ignored_penalty_drones(self):
-        
-        ignored = set()
-        
-        if self.drone_id is not None and self.partner_positions is not None:    # Check if there are no partners 
-            for partner_id, partner_pos in self.partner_positions.items():
-
-                # Calculate Manhattan distance between my position and partner's
-                dist_manhattan = abs(self.drone_position[0] - partner_pos[0]) + abs(self.drone_position[1] - partner_pos[1])
-                
-                # If partner has higher ID than mine AND distance <= 2, ignore it in penalty
-                if partner_id > self.drone_id and dist_manhattan <= 2:
-                    ignored.add(partner_id)
-        
-        return ignored
-
     # Extraction of future plans for all actions from root, following most promising moves
     def _extract_future_plans(self, root):
 
@@ -1023,7 +975,7 @@ class POMCPSolver:
 # =============================================================================
 
 # Worker function for parallel POMCP (function for multiprocessing Pool)
-def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_plans, drone_id, obstacle_map):
+def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_plans, drone_id, obstacle_map, explored_cells):
     
     # Create POMCP solver instance with necessary parameters and data
     solver = POMCPSolver(
@@ -1034,12 +986,13 @@ def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_pla
         sensor_alpha=params['alpha_sensor'],
         sensor_beta=params['beta_sensor'],
         reward_alpha=params['reward_alpha'],
+        explorative_reward=params['explorative_reward'],
         map_size=params['map_size'],
         obstacle_map=obstacle_map,
-        penalty_w=params['penalty_w'],
         drone_id=drone_id,
         dist_BFS=params['dist_BFS'],
-        r_target=params['r_target']
+        r_target=params['r_target'],
+        explored_cells=explored_cells
     )
     
     # Execute POMCP search with provided data
@@ -1066,6 +1019,8 @@ class DroneAgent:
         self.params = params    # Initial configuration parameters
         
         self.belief_map = initialize_belief_map(params) # Belief map initialization
+
+        self.explored_cells = set()     # Set of physically visited cells during the mission
         
         self.obstacle_map = initialize_obstacle_map(params) if 'obstacles' in params else np.zeros((params['map_size'], params['map_size']), dtype=int) # Obstacle map initialization
         
@@ -1078,12 +1033,13 @@ class DroneAgent:
             sensor_alpha=params['alpha_sensor'],
             sensor_beta=params['beta_sensor'],
             reward_alpha=params['reward_alpha'],
+            explorative_reward=params['explorative_reward'],
             map_size=params['map_size'],
             obstacle_map=self.obstacle_map,
-            penalty_w=params['penalty_w'],
             drone_id=self.id,
             dist_BFS=params['dist_BFS'],
-            r_target=params['r_target']
+            r_target=params['r_target'],
+            explored_cells=self.explored_cells
         )
 
         self.planned_result = None      # Dictionary to store POMCP result (best_action, future_plans, depth, visits, nodes_created)
@@ -1310,38 +1266,11 @@ class DroneAgent:
                     print(f"  [D{self.id}] Trace at {pos} already processed, skipping")
             elif isinstance(obs, int) and obs in [0, 1]:    # Standard Bayesian update for non-trace observations
                 self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, pos, obs)
+                self.explored_cells.add(pos)
         
         # Clean buffers for next turn
         self.partner_observations.clear()
         self.observation = None
-
-
-    # Method to adapt POMCP parameters based on current characteristics of the mission
-    def adapt_pomcp_parameters(self, num_drones):
-        
-        max_belief = max(1e-9, np.max(self.belief_map))
-
-        '''
-        uncertainty = 1.0 - max_belief
-        
-        self.params['reward_alpha'] = 6 * (1.0 + uncertainty)
-        '''
-
-        map_size = self.params['map_size']
-        r, c = self.pos
-        neighborhood_probs = []
-        for dr, dc in [(0,0), (-1,0), (1,0), (0,-1), (0,1)]:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < map_size and 0 <= nc < map_size and self.obstacle_map[nr, nc] == 0:
-                neighborhood_probs.append(self.belief_map[nr, nc])
-                
-        local_belief = max(neighborhood_probs) if neighborhood_probs else 1e-9
-        
-        relevance = local_belief / max_belief
-        
-        base_w = 0.5 * (4.0 / max(1, num_drones))
-        #self.params['penalty_w'] = base_w * relevance
-        
 
 # =============================================================================
 # 4. GRAPHIC FUNCTIONS 
@@ -1588,19 +1517,11 @@ def run_simulation(params):
 
                 step_counter += 1
                 print(f"\n--- STEP {step_counter} ---")
-
                 
-                
-                # ADAPT POMCP PARAMETERS FOR EACH DRONE BASED ON CURRENT STATE
-                for drone in drones:
-                    drone.adapt_pomcp_parameters(num_drones)
-                
-                
-
                 # PARALLEL PLANNING (POMCP for each drone)
                 tasks = []
                 for drone in drones:
-                    task = (drone.params, drone.belief_map.copy(), drone.pos, drone.partner_positions.copy(), drone.partner_future_plans.copy(), drone.id, drone.obstacle_map)
+                    task = (drone.params, drone.belief_map.copy(), drone.pos, drone.partner_positions.copy(), drone.partner_future_plans.copy(), drone.id, drone.obstacle_map, drone.explored_cells.copy())
                     tasks.append(task)
                 
                 # Multiprocessing pool to execute POMCPs in parallel for each drone, collecting results in a list
