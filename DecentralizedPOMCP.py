@@ -1,4 +1,5 @@
 import math
+from scipy.ndimage import label, distance_transform_edt
 import random
 import time
 import numpy as np
@@ -11,7 +12,7 @@ from collections import deque
 # 1.PARAMETERS CONFIGURATION 
 # =============================================================================
 DEFAULT_CONFIG = {
-    'map_size': 20,
+    'map_size': 25,
     'alpha_sensor': 0.0,
     'beta_sensor': 0.0,
     'max_time': 2.5,
@@ -55,6 +56,24 @@ COLORS = {
     'YELLOW': (255, 255, 0),
     'DARK_GRAY': (128, 128, 128)
 }
+
+# Fixed palette for DARP area rendering
+DARP_AREA_COLORS = [
+    (144, 238, 144),
+    (255, 160, 160),
+    (216, 191, 216),
+    (173, 216, 230),
+    (255, 255, 204),
+    (210, 180, 140),
+    (211, 211, 211),
+    (255, 218, 185),
+    (176, 224, 230),
+    (221, 160, 221),
+    (189, 252, 201),
+    (255, 228, 196),
+    (240, 230, 140),
+    (224, 255, 255)
+]
 
 # Function to collect user input through graphical interface
 def get_user_parameters():
@@ -452,6 +471,13 @@ def get_user_parameters():
     
     params_dict['dist_BFS'] = dist_BFS      # Add the BFS distance lookup table to parameters
     
+    #Call DARP partitioning if uniform map is selected, to divide the map into equal areas for each drone
+    if params_dict['map_type'] == 1: 
+        print("\n[DARP] Starting DARP algorithm...")
+        assignment_matrix = darp_partitioning(params_dict)
+        params_dict['darp_assignment'] = assignment_matrix
+        print("[DARP] Division completed successfully.")
+
     # return the complete parameters dictionary
     return params_dict
 
@@ -518,6 +544,182 @@ def initialize_belief_map(params):
         
     return belief_map
 
+# Function to perform DARP partitioning to divide areas in equal parts for each drone
+def darp_partitioning(params, max_iter=80000, variate_weight=0.01, random_level=0.0001, limit_cells_diff=2, use_importance=True):
+    
+    map_size = params['map_size']
+    num_drones = params['num_drones']
+    drone_positions = params['drone_positions']
+    obstacle_map = initialize_obstacle_map(params) 
+    
+    # Parameters and initial calculations
+    tot_obstacles = np.sum(obstacle_map) 
+    tot_cells = map_size * map_size 
+    free_cells = tot_cells - num_drones - tot_obstacles
+
+    term_thr = 1 if free_cells % num_drones != 0 else 0     # Starting threshold for termination condition, 0 if perfect division is possible, otherwise 1
+
+    # Initialization matrices D based on BFS distances for each drone
+    list_mat_D = np.zeros((num_drones, map_size, map_size))
+    for r in range(num_drones):
+        start_pos = drone_positions[r]
+        for i in range(map_size):
+            for j in range(map_size):
+                if obstacle_map[i, j] == 1 or (i, j) in drone_positions:
+                    list_mat_D[r, i, j] = float('inf') # Ignore obstacles and drone initial positions
+                else:
+                    dist = params['dist_BFS'].get((start_pos, (i, j)))
+                    list_mat_D[r, i, j] = dist if dist is not None else float('inf')
+                    
+    # Management of previous infinite values for subsequent calculations (we replace inf values with a large finite values related to the maximum valid distance found)
+    max_valid_dist = np.max(list_mat_D[list_mat_D != float('inf')]) 
+    list_mat_D[list_mat_D == float('inf')] = max_valid_dist * 2 # Penalizza celle irraggiungibili
+    
+    # Calculate importance of cells based on distances (cells closer to a drone and farther from others are more important) 
+    cells_importance = np.zeros((num_drones, map_size, map_size))
+    max_importance = np.zeros(num_drones)
+    min_importance = np.full(num_drones, float('inf'))
+    
+    # Calculation of importance values for each cell and drone, based on the formula: Importance = 1 / (Sum_Other_Distances) 
+    for i in range(map_size):
+        for j in range(map_size):
+            tot_dist_sum = np.sum(list_mat_D[:, i, j]) 
+            for r in range(num_drones):
+                other_dist_sum = tot_dist_sum - list_mat_D[r, i, j]
+                cells_importance[r, i, j] = 1.0 / other_dist_sum if other_dist_sum > 0 else 0.0
+                
+                if cells_importance[r, i, j] > max_importance[r]:
+                    max_importance[r] = cells_importance[r, i, j]
+                if cells_importance[r, i, j] < min_importance[r]:
+                    min_importance[r] = cells_importance[r, i, j]
+
+    # Initialize assignment matrix A, list of assigned cells for each drone, and connectivity status of regions for each drone 
+    list_mat_D_copy = np.copy(list_mat_D)
+    mat_A = np.zeros((map_size, map_size), dtype=int)
+    list_uavs_cells = np.zeros(num_drones, dtype=int)
+    list_connected_regions = np.zeros(num_drones, dtype=bool)
+    
+    success = False     # Termination flag
+    
+    # DARP logic algorithm 
+
+    # While cycle to increment the threshold for termination condition (max tolerance=2)
+    while term_thr <= limit_cells_diff and not success:
+        
+        down_thres = (tot_cells - term_thr * (num_drones - 1)) / (tot_cells * num_drones)
+        upper_thres = (tot_cells + term_thr) / (tot_cells * num_drones)
+        
+        success = True
+        iter_count = 0
+        
+        # Main loop of DARP algorithm
+        while iter_count <= max_iter:
+            
+            # Assignment A matrix based on the minimum distance metric D and count of assigned cells for each drone 
+            list_uavs_cells.fill(0)
+            list_personal_assignment = np.zeros((num_drones, map_size, map_size), dtype=int)
+            
+            for i in range(map_size):
+                for j in range(map_size):
+                    if obstacle_map[i, j] == 0 and (i, j) not in drone_positions:
+                        ind_min = np.argmin(list_mat_D_copy[:, i, j])
+                        mat_A[i, j] = ind_min
+                        list_personal_assignment[ind_min, i, j] = 1
+                        list_uavs_cells[ind_min] += 1
+                    else:
+                        mat_A[i, j] = -1 # Obstacles/drone positions
+
+            # Assicura le posizioni iniziali
+            for r, pos in enumerate(drone_positions):
+                list_personal_assignment[r, pos[0], pos[1]] = 1
+                
+            list_mat_C = []
+            plainErrors = np.zeros(num_drones)      # Percentage of cells assigned to each drone (for fairness evaluation)
+            divFairError = np.zeros(num_drones)     # Deviation from the ideal division (for fairness evaluation)
+            
+            # Check connectivity of assigned regions for each drone
+            for r in range(num_drones):
+                normalized_mat_C = np.ones((map_size, map_size))
+                list_connected_regions[r] = True
+                
+                # Adjacent cells condition (up, down, left, right)
+                adj_cells = np.array([[0,1,0],
+                                      [1,1,1],
+                                      [0,1,0]]) 
+                labeled_array, num_islands = label(list_personal_assignment[r], structure=adj_cells)
+                
+                if num_islands > 1:
+                    list_connected_regions[r] = False
+                    
+                    # Find initial position label for the drone's region
+                    start_label = labeled_array[drone_positions[r][0], drone_positions[r][1]]
+                    
+                    # Region Ri: connected cells of the drone 
+                    Ri_reg = (labeled_array == start_label).astype(int)
+                    # Region Qi: disconnected cells of the drone (islands)
+                    Qi_reg = ((list_personal_assignment[r] == 1) & (labeled_array != start_label)).astype(int)
+                    
+                    # Formula of connectivity matrix: C_i|x,y= min(||[x,y]−r||) − min(||[x,y]−q||)
+                    dist_to_uav = distance_transform_edt(1 - Ri_reg)        # min(||[x,y]−r||)
+                    dist_to_island = distance_transform_edt(1 - Qi_reg)     # min(||[x,y]−q||)
+                    
+                    mat_C = dist_to_uav - dist_to_island
+                    max_v, min_v = np.max(mat_C), np.min(mat_C)
+                    if max_v > min_v:
+                        normalized_mat_C = (mat_C - min_v) * ((2 * variate_weight) / (max_v - min_v)) + (1 - variate_weight)
+                
+                list_mat_C.append(normalized_mat_C)
+                
+                # Division error evaluation for fairness (same number of cells assigned to each drone)
+                plainErrors[r] = list_uavs_cells[r] / free_cells
+                if plainErrors[r] < down_thres:
+                    divFairError[r] = down_thres - plainErrors[r]
+                elif plainErrors[r] > upper_thres:
+                    divFairError[r] = upper_thres - plainErrors[r]
+            
+            # Termination condition 
+            max_cells_ass = np.max(list_uavs_cells)
+            min_cells_ass = np.min(list_uavs_cells)
+            if (max_cells_ass - min_cells_ass) <= term_thr and np.all(list_connected_regions):
+                break
+                 
+            total_neg_perc = np.sum(np.abs(divFairError[divFairError < 0])) # Total percentage of negative fairness errors
+            total_neg_plain_errors = np.sum(plainErrors[divFairError < 0])  # Total sum of plain errors for negative fairness errors
+            
+            # Normalized formula for fairness correction coefficient m (basic formula: mi =mi +c(ki −f))
+            for r in range(num_drones):
+                coeff_m = 1.0
+                if total_neg_plain_errors != 0.0:
+                    if divFairError[r] < 0.0:
+                        coeff_m = 1.0 + (plainErrors[r] / total_neg_plain_errors) * (total_neg_perc / 2.0)
+                    else:
+                        coeff_m = 1.0 - (plainErrors[r] / total_neg_plain_errors) * (total_neg_perc / 2.0)
+                
+                # Union of coeff_m and connectivity information to find final correction
+                criterionMatrix = np.copy(cells_importance[r])
+                if use_importance:
+                    diff_imp = max_importance[r] - min_importance[r]
+                    if divFairError[r] < 0:
+                        criterionMatrix = (cells_importance[r] - min_importance[r]) * ((coeff_m - 1) / diff_imp) + 1
+                    else:
+                        criterionMatrix = (cells_importance[r] - min_importance[r]) * ((1 - coeff_m) / diff_imp) + coeff_m
+                else:
+                    criterionMatrix.fill(coeff_m)
+                    
+                # Random variation to manage the local minima and pairs of cells with the same distance values
+                RM = 2.0 * random_level * np.random.rand(map_size, map_size) + 1.0 - random_level
+                
+                # Final update formula : Ei =Ci ⦿ (miEi)
+                list_mat_D_copy[r] = list_mat_D_copy[r] * criterionMatrix * RM * list_mat_C[r]
+
+            iter_count += 1
+            
+        if iter_count >= max_iter:
+            max_iter //= 2
+            success = False
+            term_thr += 1
+
+    return mat_A
 
 # BFS algorithm to precompute distances between cells, considering obstacles (used in rollout)
 def precompute_BFS_distances(map_size, obstacle_map):
@@ -1277,6 +1479,7 @@ class DroneAgent:
 # =============================================================================
 
 # Draw grid, heatmap and percentages on background
+# Draw grid, heatmap, DARP regions, and percentages on background
 def draw_static_background(graphics_ctx, belief_map):
     
     surface = graphics_ctx['background_surface']
@@ -1287,10 +1490,16 @@ def draw_static_background(graphics_ctx, belief_map):
     
     max_prob = belief_map.max()
     obstacle_map = initialize_obstacle_map(params) if 'obstacles' in params else None
+    
+    # Recuperiamo la matrice DARP se è stata calcolata (es. mappa uniforme)
+    darp_matrix = params.get('darp_assignment', None)
+    drone_start_positions = params.get('drone_positions', [])
+    
+    drone_colors = DARP_AREA_COLORS
 
     surface.fill(COLORS['WHITE'])
 
-    # Draw grid with coloring based on belief map and obstacles
+    # Draw grid with coloring based on belief map, obstacles, and DARP
     for r in range(map_size):
         for c in range(map_size):
             x = c * cell_size
@@ -1300,21 +1509,48 @@ def draw_static_background(graphics_ctx, belief_map):
             if obstacle_map is not None and obstacle_map[r, c] == 1:
                 color = COLORS['BLACK']
             else:
-                if max_prob > 1e-9:
-                    color_val = int(255 * ((prob / max_prob) ** 0.4))
-                    color = (255 - color_val, 255 - color_val, 255)
+                # Se il DARP è attivo e la cella ha un'assegnazione valida
+                if darp_matrix is not None and darp_matrix[r, c] != -1:
+                    drone_idx = darp_matrix[r, c]
+                    # Prendi il colore corrispondente al drone
+                    base_color = drone_colors[drone_idx % len(drone_colors)]
+                    
+                    if max_prob > 1e-9:
+                        # Calcola l'intensità in base alla probabilità (Heatmap)
+                        intensity = ((prob / max_prob) ** 0.4)
+                        # Interpola il colore: base pastello (20%) + saturazione basata sulla prob (fino all'80%)
+                        color = (
+                            int(255 - (255 - base_color[0]) * (0.2 + 0.6 * intensity)),
+                            int(255 - (255 - base_color[1]) * (0.2 + 0.6 * intensity)),
+                            int(255 - (255 - base_color[2]) * (0.2 + 0.6 * intensity))
+                        )
+                    else:
+                        # Colore pastello molto chiaro se probabilità è ~0
+                        color = (
+                            int(255 - (255 - base_color[0]) * 0.2),
+                            int(255 - (255 - base_color[1]) * 0.2),
+                            int(255 - (255 - base_color[2]) * 0.2)
+                        )
+                elif darp_matrix is not None and (r, c) in drone_start_positions:
+                    start_idx = drone_start_positions.index((r, c))
+                    color = drone_colors[start_idx % len(drone_colors)]
                 else:
-                    color = (255, 255, 255)
+                    # Logica originale (solo heatmap blu) se DARP non è usato
+                    if max_prob > 1e-9:
+                        color_val = int(255 * ((prob / max_prob) ** 0.4))
+                        color = (255 - color_val, 255 - color_val, 255)
+                    else:
+                        color = (255, 255, 255)
 
             pygame.draw.rect(surface, color, (x, y, cell_size, cell_size))
             pygame.draw.rect(surface, COLORS['BLACK'], (x, y, cell_size, cell_size), 1)
 
+            # Stampa la percentuale
             if obstacle_map is None or obstacle_map[r, c] == 0:
                 text = font_cell.render(f"{prob * 100:.3f}%", True, COLORS['BLACK'])
                 text_rect = text.get_rect(centerx=x + cell_size // 2, bottom=y + cell_size - max(2, cell_size // 20))
                 surface.blit(text, text_rect)
-
-
+                
 # Draw dynamic elements: drones, target, traces and sidebar with statistics
 def draw_elements(graphics_ctx, drones, target_pos, traces, stats):
     
