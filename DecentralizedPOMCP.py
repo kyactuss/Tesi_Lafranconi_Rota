@@ -1,3 +1,5 @@
+import elkai
+from collections import deque
 import math
 from scipy.ndimage import label, distance_transform_edt
 import random
@@ -12,9 +14,9 @@ from collections import deque
 # 1.PARAMETERS CONFIGURATION 
 # =============================================================================
 DEFAULT_CONFIG = {
-    'map_size': 25,
-    'alpha_sensor': 0.0,
-    'beta_sensor': 0.0,
+    'map_size': 20,
+    'alpha_sensor': 0.01,
+    'beta_sensor': 0.01,
     'max_time': 2.5,
     'depth_limit': 1000,
     'discount_factor': 0.95,
@@ -1208,9 +1210,105 @@ def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_pla
         'future_plans': future_plans
     }
 
+# TSP solver for systematic exploration of assigned DARP areas.
+class TSPSolver:
+    
+    def __init__(self, map_size, obstacle_map, drone_id, start_pos, darp_matrix):
+        self.map_size = map_size
+        self.obstacle_map = obstacle_map
+        self.drone_id = drone_id
+        self.start_pos = start_pos
+        self.darp_matrix = darp_matrix
+    
+    # Generate a sequence of actions to visit all cells assigned to the drone by DARP
+    def generate_full_plan(self):
+        local_obstacle_map = np.copy(self.obstacle_map)     # Local map where non-DARP cells are treated as obstacles
+        free_cells = []
+        
+        for r in range(self.map_size):
+            for c in range(self.map_size):
+                
+                if self.darp_matrix[r, c] == self.drone_id - 1 and self.obstacle_map[r, c] == 0:
+                    free_cells.append((r, c))
+                else:
+                    local_obstacle_map[r, c] = 1
+                    
+        # INUTILE??
+        if self.start_pos not in free_cells:
+            free_cells.insert(0, self.start_pos)
+            local_obstacle_map[self.start_pos[0], self.start_pos[1]] = 0
+            
+        num_free_cells = len(free_cells)
+
+        # INUTILE??
+        if num_free_cells <= 1:
+            return []
+            
+        bfs_distances = precompute_BFS_distances(self.map_size, local_obstacle_map)
+                
+        elk_matrix = [[0] * num_free_cells for _ in range(num_free_cells)]
+        for i in range(num_free_cells):
+            for j in range(num_free_cells):
+                pos_i = free_cells[i]
+                pos_j = free_cells[j]
+                if i == j:
+                    elk_matrix[i][j] = 0
+                else:
+                    elk_matrix[i][j] = int(bfs_distances.get((pos_i, pos_j), 999999))
+            
+        # Use elkai to find the TSP tour
+        try:
+            tour_indices = elkai.solve_int_matrix(elk_matrix)
+        except Exception as e:
+            print(f"  [D{self.drone_id}] Error in elkai solver: {e}")
+            return []
+            
+        # Reorder the tour to start from the drone's starting position
+        start_idx = free_cells.index(self.start_pos)
+        if start_idx in tour_indices:
+            idx_in_tour = tour_indices.index(start_idx)
+            ordered_tour = tour_indices[idx_in_tour:] + tour_indices[:idx_in_tour]
+        else:
+            ordered_tour = tour_indices
+            
+        # Add the start position at the end of the tour to complete the cycle
+        ordered_tour.append(ordered_tour[0])
+            
+        # Convert sequence of nodes (cells) to sequence of actions (N, S, E, W)
+        actions = []
+        current_pos = free_cells[ordered_tour[0]]
+        
+        for next_node_idx in ordered_tour[1:]:
+            next_pos = free_cells[next_node_idx]
+            
+            # Construct path from current_pos to next_pos using steepest descent on BFS distances from next_pos
+            while current_pos != next_pos:
+                best_action = None
+                best_next = None
+                min_d = float('inf')
+                
+                for action, delta in MOVES_DELTA.items():
+                    if action == 'Stay':
+                        continue
+                    nr, nc = current_pos[0] + delta[0], current_pos[1] + delta[1]
+                    if 0 <= nr < self.map_size and 0 <= nc < self.map_size and local_obstacle_map[nr, nc] == 0:
+                        d = bfs_distances.get((next_pos, (nr, nc)), float('inf'))
+                        if d < min_d:
+                            min_d = d
+                            best_action = action
+                            best_next = (nr, nc)
+                            
+                if best_action is None:
+                    break  # Edge case: disconnected region, skip to next node
+                    
+                actions.append(best_action)
+                current_pos = best_next
+                
+        return actions
+
 
 # =============================================================================
-# 3. DRONE AGENT 
+# 4. DRONE AGENT 
 # =============================================================================
 
 class DroneAgent:
@@ -1219,6 +1317,8 @@ class DroneAgent:
 
         self.id = drone_id      # Drone id
         self.params = params    # Initial configuration parameters
+        
+        self.search_mode = 'TSP' if params['map_type'] == 1 else 'POMCP'    # Set search mode based on map type
         
         self.belief_map = initialize_belief_map(params) # Belief map initialization
 
@@ -1250,13 +1350,27 @@ class DroneAgent:
         self.final_action = None        # Contains final action to execute
         self.future_plans_buffer = {}   # Buffer for own future plans (including root action)
         self.observation = None         # Last observation received from real sensor
-        
+        self.positive_obs_count = 0     # Counter for positive observations received for TSP mode
+
         self.partner_positions = partner_positions if partner_positions is not None else {}     # Dictionary to store current partner positions received
         self.partner_final_actions = {}     # Dictionary to store intentions (best_action) received from partners
         self.partner_future_plans = {}      # Dictionary to store partner future plans received
         self.partner_observations = {}      # Dictionary to store observations received from partners
         
         self.discovered_traces = set()      # Set to track already discovered traces (by position) to avoid reprocessing
+        
+        if self.search_mode == 'TSP':
+            self.tsp_plan = deque()         # Initialize tsp_plan if TSP mode is active
+            self.tsp_solver = TSPSolver(
+                map_size=params['map_size'],
+                obstacle_map=self.obstacle_map,
+                drone_id=self.id,
+                start_pos=self.pos,
+                darp_matrix=params.get('darp_assignment')
+            )   
+            full_plan = self.tsp_solver.generate_full_plan()        # Generate full plan and populate tsp_plan
+            self.tsp_plan.extend(full_plan)
+
 
 
     # Method that simulates sending own movement intention to companion
@@ -1464,6 +1578,10 @@ class DroneAgent:
                     self.belief_map = self.apply_trace_distribution(obs)
                     self.discovered_traces.add(pos)
                     print(f"  [D{self.id}] New trace discovered at {pos} of type '{obs['type']}'")
+                    # Switch from TSP to POMCP mode when trace is detected
+                    if self.search_mode == 'TSP':
+                        self.search_mode = 'POMCP'
+                        print(f"  [D{self.id}] Switching from TSP to POMCP mode due to trace detection")
                 else:
                     print(f"  [D{self.id}] Trace at {pos} already processed, skipping")
             elif isinstance(obs, int) and obs in [0, 1]:    # Standard Bayesian update for non-trace observations
@@ -1472,7 +1590,6 @@ class DroneAgent:
         
         # Clean buffers for next turn
         self.partner_observations.clear()
-        self.observation = None
 
 # =============================================================================
 # 4. GRAPHIC FUNCTIONS 
@@ -1480,7 +1597,7 @@ class DroneAgent:
 
 # Draw grid, heatmap and percentages on background
 # Draw grid, heatmap, DARP regions, and percentages on background
-def draw_static_background(graphics_ctx, belief_map):
+def draw_static_background(graphics_ctx, belief_map, drones=None):
     
     surface = graphics_ctx['background_surface']
     cell_size = graphics_ctx['CELL_SIZE']
@@ -1499,6 +1616,10 @@ def draw_static_background(graphics_ctx, belief_map):
 
     surface.fill(COLORS['WHITE'])
 
+    is_pomcp_mode = False
+    if drones is not None:
+        is_pomcp_mode = any(getattr(drone, 'search_mode', None) == 'POMCP' for drone in drones)
+
     # Draw grid with coloring based on belief map, obstacles, and DARP
     for r in range(map_size):
         for c in range(map_size):
@@ -1509,9 +1630,13 @@ def draw_static_background(graphics_ctx, belief_map):
             if obstacle_map is not None and obstacle_map[r, c] == 1:
                 color = COLORS['BLACK']
             else:
-                # Se il DARP è attivo e la cella ha un'assegnazione valida
-                if darp_matrix is not None and darp_matrix[r, c] != -1:
-                    drone_idx = darp_matrix[r, c]
+                
+                if not is_pomcp_mode and darp_matrix is not None and (darp_matrix[r, c] != -1 or (r, c) in drone_start_positions):
+                    if darp_matrix[r, c] != -1:
+                        drone_idx = darp_matrix[r, c]
+                    else:
+                        drone_idx = drone_start_positions.index((r, c))
+                        
                     # Prendi il colore corrispondente al drone
                     base_color = drone_colors[drone_idx % len(drone_colors)]
                     
@@ -1531,11 +1656,8 @@ def draw_static_background(graphics_ctx, belief_map):
                             int(255 - (255 - base_color[1]) * 0.2),
                             int(255 - (255 - base_color[2]) * 0.2)
                         )
-                elif darp_matrix is not None and (r, c) in drone_start_positions:
-                    start_idx = drone_start_positions.index((r, c))
-                    color = drone_colors[start_idx % len(drone_colors)]
                 else:
-                    # Logica originale (solo heatmap blu) se DARP non è usato
+                    # Logica originale (solo heatmap blu) se DARP non è usato o se in modalità POMCP
                     if max_prob > 1e-9:
                         color_val = int(255 * ((prob / max_prob) ** 0.4))
                         color = (255 - color_val, 255 - color_val, 255)
@@ -1684,15 +1806,117 @@ def init_graphics(params):
     }
 
 
+# Disegna i percorsi TSP completi
+def draw_tsp_paths(graphics_ctx, drones):
+    """
+    Independent graphic function to draw the calculated TSP paths.
+    - Draws a solid thin line with directional arrows at the cell boundaries.
+    - Turns the line/arrow red and double-directional if passing through a cell multiple times.
+    - Uses transparent colors to keep underlying text readable.
+    """
+    screen = graphics_ctx['screen']
+    CELL_SIZE = graphics_ctx['CELL_SIZE']
+    
+    # Crea una superficie temporanea con supporto alpha per la trasparenza
+    overlay = pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+
+    def draw_boundary_arrow(surface, color, start_pos, end_pos, width=1, is_double=False):
+        x1, y1 = start_pos
+        x2, y2 = end_pos
+        
+        # Disegna una linea continua sottile
+        pygame.draw.line(surface, color, (x1, y1), (x2, y2), width)
+        
+        # Metà esatta tra i due centri, sul confine tra le due celle
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        
+        angle = math.atan2(y2 - y1, x2 - x1)
+        arrow_len = max(5, CELL_SIZE * 0.20)
+        arrow_rad = 0.5  # Angolo apertura punta
+        
+        # Funzione interna per disegnare la punta (a forma di V)
+        def draw_head(cx, cy, ang):
+            p1 = (cx - arrow_len * math.cos(ang - arrow_rad), cy - arrow_len * math.sin(ang - arrow_rad))
+            p2 = (cx - arrow_len * math.cos(ang + arrow_rad), cy - arrow_len * math.sin(ang + arrow_rad))
+            pygame.draw.line(surface, color, (cx, cy), p1, width)
+            pygame.draw.line(surface, color, (cx, cy), p2, width)
+            
+        # Punta primaria verso l'arrivo
+        draw_head(mx, my, angle)
+        
+        if is_double:
+            # Punta secondaria (verso la partenza) per il doppio senso
+            draw_head(mx, my, angle + math.pi)
+
+    from collections import Counter
+    
+    has_paths = False
+    
+    for drone in drones:
+        if getattr(drone, 'search_mode', None) == 'TSP' and hasattr(drone, 'tsp_plan'):
+            if not drone.tsp_plan:
+                continue
+
+            # Simula il piano di movimento futuro
+            current_r, current_c = drone.pos
+            path_cells = [(current_r, current_c)]
+            
+            for action in drone.tsp_plan:
+                dr, dc = MOVES_DELTA.get(action, (0, 0))
+                if action == 'Stay':
+                    continue
+                current_r += dr
+                current_c += dc
+                path_cells.append((current_r, current_c))
+                
+            if len(path_cells) < 2:
+                continue
+            
+            has_paths = True
+            
+            # Conta le occorrenze di ciascuna cella nel percorso previsto
+            cell_visits = Counter(path_cells)
+            
+            for i in range(len(path_cells) - 1):
+                r1, c1 = path_cells[i]
+                r2, c2 = path_cells[i+1]
+                
+                # Centri delle celle
+                x1 = c1 * CELL_SIZE + CELL_SIZE // 2
+                y1 = r1 * CELL_SIZE + CELL_SIZE // 2
+                x2 = c2 * CELL_SIZE + CELL_SIZE // 2
+                y2 = r2 * CELL_SIZE + CELL_SIZE // 2
+                
+                # Se la cella di partenza o di arrivo del segmento è passata più di una volta
+                is_overlap = cell_visits[(r1, c1)] > 1 or cell_visits[(r2, c2)] > 1
+                
+                if is_overlap:
+                    color = (255, 0, 0, 110)  # Rosso trasparente (alpha=110)
+                    double_arrow = True
+                else:
+                    color = (0, 0, 0, 110)    # Nero trasparente (alpha=110)
+                    double_arrow = False
+                    
+                # Spessore 1 per massima finezza, disegnato sull'overlay trasparente
+                draw_boundary_arrow(overlay, color, (x1, y1), (x2, y2), width=1, is_double=double_arrow)
+                
+    # Applica l'overlay trasparente allo schermo reale solo se abbiamo disegnato qualcosa
+    if has_paths:
+        screen.blit(overlay, (0, 0))
+
+
 # Complete frame rendering
 def render_frame(graphics_ctx, drones, target_pos, traces, ui_stats):
     
-    draw_static_background(graphics_ctx, drones[0].belief_map)
+    draw_static_background(graphics_ctx, drones[0].belief_map, drones)
     
     graphics_ctx['screen'].fill(COLORS['WHITE'])
     graphics_ctx['screen'].blit(graphics_ctx['background_surface'], (0, 0))
     
     draw_elements(graphics_ctx, drones, target_pos, traces, ui_stats)
+    
+    # CHIAMATA MOMENTANEA ALLA GRAFICA PER TSP
+    draw_tsp_paths(graphics_ctx, drones)
     
     pygame.display.flip()
 
@@ -1744,68 +1968,117 @@ def run_simulation(params):
     running = True
     auto_mode = False
     step_counter = 0
+    move_interval_sec = 0.5
+    last_step_time = 0.0
 
     # MAIN LOOP
     try:
         while running:
             
-            if auto_mode:
+            if auto_mode and (time.monotonic() - last_step_time) >= move_interval_sec:
+                last_step_time = time.monotonic()
 
                 step_counter += 1
                 print(f"\n--- STEP {step_counter} ---")
-                
-                # PARALLEL PLANNING (POMCP for each drone)
+
+
+                # Check if all TSP plans are empty for each drones to switch to POMCP
+                all_tsp_empty = True
+                for drone in drones:
+                    if hasattr(drone, 'tsp_plan') and len(drone.tsp_plan) > 0:
+                        all_tsp_empty = False
+                        break
+                if all_tsp_empty:
+                    for drone in drones:
+                        if getattr(drone, 'search_mode', None) == 'TSP':
+                            drone.search_mode = 'POMCP'
+                            print(f"  [D{drone.id}] Switching from TSP to POMCP mode because all TSP plans are empty")
+
+
+                # PARALLEL PLANNING (POMCP) or SYSTEMATIC EXPLORATION (TSP)
                 tasks = []
                 for drone in drones:
-                    task = (drone.params, drone.belief_map.copy(), drone.pos, drone.partner_positions.copy(), drone.partner_future_plans.copy(), drone.id, drone.obstacle_map, drone.explored_cells.copy())
-                    tasks.append(task)
-                
-                # Multiprocessing pool to execute POMCPs in parallel for each drone, collecting results in a list
-                results = pool.starmap(worker_pomcp_task, tasks)
-                
-                # Update each drone with its own POMCP results
-                for i, drone in enumerate(drones):
-                    drone.planned_result = results[i]
-                    drone.final_action = results[i]['best_action']
-                    drone.future_plans_buffer = results[i]['future_plans']
-                
-                # Print future plans for all drones
-                print(f"\n=== FUTURE PLANS FOR ALL DRONES ===")
-                for drone in drones:
-                    print(f"\nDrone {drone.id} (pos {drone.pos}):")
-                    for action, plan in drone.future_plans_buffer.items():
-                        print(f"  If action '{action}': {' -> '.join(plan)}")
+                    if drone.search_mode == 'TSP':
+                        
+                        # Management of positive obs in TSP mode
+                        if drone.observation == 1:
+                            drone.positive_obs_count += 1       # Increment of positive obs count to force Stay in next turns
+                            drone.tsp_plan.appendleft('Stay')
+                            
+                        elif drone.observation == 0 and drone.positive_obs_count > 0:
+                            drone.positive_obs_count -= 1       # Decrement of positive obs count to return to normal TSP moves
+                            
+                            if drone.positive_obs_count > 0:
+                                drone.tsp_plan.appendleft('Stay')
 
-                # Each drone sends its intention (position and predicted action) to other drones
-                intention_packets = [drone.send_intention() for drone in drones]
+                        # Action execution in TSP list
+                        if drone.tsp_plan:
+                            action = drone.tsp_plan.popleft()
+                            drone.final_action = action
+                        else:
+                            drone.final_action = 'Stay'
+                            
+                        # DA AGGIUSTARE QUANDO FAREMO GRAFICA TSP
+                        drone.planned_result = {
+                            'best_action': drone.final_action,
+                            'depth': 0,
+                            'visits': 0,
+                            'nodes_created': 0,
+                            'future_plans': {}
+                        }
+                        drone.future_plans_buffer = {}
+
+                    elif drone.search_mode == 'POMCP':
+                        task = (drone.params, drone.belief_map.copy(), drone.pos, drone.partner_positions.copy(), drone.partner_future_plans.copy(), drone.id, drone.obstacle_map, drone.explored_cells.copy())
+                        tasks.append(task)
                 
-                # Each drone receives intentions from other drones and updates its attributes (partner_final_actions and partner_positions)
-                for drone in drones:
-                    for pkt in intention_packets:
-                        if pkt['id'] != drone.id:
-                            drone.receive_intention(pkt['id'], pkt['pos'], pkt['best_action'])
-                
-                # CONFLICT RESOLUTION
-                for drone in drones:
-                    drone.resolve_conflicts_local()
+                if tasks:
+                    # Multiprocessing pool to execute POMCPs in parallel for each drone, collecting results in a list
+                    results = pool.starmap(worker_pomcp_task, tasks)
+                    
+                    # Update each drone with its own POMCP results
+                    for i, drone in enumerate(drones):
+                        drone.planned_result = results[i]
+                        drone.final_action = results[i]['best_action']
+                        drone.future_plans_buffer = results[i]['future_plans']
+                    
+                    # Print future plans for all drones
+                    print(f"\n=== FUTURE PLANS FOR ALL DRONES ===")
+                    for drone in drones:
+                        print(f"\nDrone {drone.id} (pos {drone.pos}):")
+                        for action, plan in drone.future_plans_buffer.items():
+                            print(f"  If action '{action}': {' -> '.join(plan)}")
+
+                    # Each drone sends its intention (position and predicted action) to other drones
+                    intention_packets = [drone.send_intention() for drone in drones]
+                    
+                    # Each drone receives intentions from other drones and updates its attributes (partner_final_actions and partner_positions)
+                    for drone in drones:
+                        for pkt in intention_packets:
+                            if pkt['id'] != drone.id:
+                                drone.receive_intention(pkt['id'], pkt['pos'], pkt['best_action'])
+                    
+                    # CONFLICT RESOLUTION
+                    for drone in drones:
+                        drone.resolve_conflicts_local()
 
                 # MOVEMENT
                 for drone in drones:
                     drone.execute_move()
 
-                # PERCEPTION
+                # PERCEPTION (for all drones: both TSP and POMCP)
                 for drone in drones:
                     drone.get_real_observation(target_pos, traces)
                 
                 observation_packets = [drone.send_observation_and_future_plan() for drone in drones]
                 
-                # OBSERVATION COMMUNICATION
+                # OBSERVATION COMMUNICATION (for all drones: both TSP and POMCP)
                 for drone in drones:
                     for pkt in observation_packets:
                         if pkt['id'] != drone.id:
                             drone.receive_remote_observation(pkt['id'], pkt['pos'], pkt['observation'], pkt['future_plan'])
                 
-                # BELIEF UPDATE
+                # BELIEF UPDATE (for all drones: both TSP and POMCP)
                 for drone in drones:
                     drone.update_belief_from_all_obs()
 
@@ -1844,6 +2117,7 @@ def run_simulation(params):
                     if event.key == pygame.K_SPACE: 
                         auto_mode = not auto_mode
                         if auto_mode:
+                            last_step_time = time.monotonic() - move_interval_sec
                             print("\n✓ Modalità AUTO POMCP attivata")
                         else:
                             print("\n✓ Modalità AUTO disattivata")
