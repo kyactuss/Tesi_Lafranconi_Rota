@@ -15,8 +15,8 @@ from collections import deque
 # =============================================================================
 DEFAULT_CONFIG = {
     'map_size': 20,
-    'alpha_sensor': 0.01,
-    'beta_sensor': 0.01,
+    'alpha_sensor': 0.02,
+    'beta_sensor': 0.02,
     'max_time': 2.5,
     'depth_limit': 1000,
     'discount_factor': 0.95,
@@ -903,7 +903,7 @@ class POMCPSolver:
             child_node = node.children[(action, observation)]
         else:
             _, next_drone_pos = next_state
-            new_belief_map = self.get_updated_belief_map(node.belief_map, next_drone_pos, observation)
+            new_belief_map = self.get_updated_belief_map_with_sensors(node.belief_map, next_drone_pos, observation, self.sensor_alpha, self.sensor_beta)
             
             child_node = POMCPNode(belief_map=new_belief_map, parent=node)
             node.children[(action, observation)] = child_node
@@ -1014,18 +1014,18 @@ class POMCPSolver:
 
         return next_state, obs, total_reward, terminal
 
-    # Bayesian update of belief map 
-    def get_updated_belief_map(self, current_belief, drone_pos, observation):
+    # Bayesian update of belief map using explicitly provided sensor parameters
+    def get_updated_belief_map_with_sensors(self, current_belief, drone_pos, observation, alpha_sensor, beta_sensor):
         
         # Definition of Psi and Phi    
         if observation == 1:
             # Positive Detection
-            Psi = 1.0 - self.sensor_beta  # True Positive
-            Phi = self.sensor_alpha       # False Positive
+            Psi = 1.0 - beta_sensor  # True Positive
+            Phi = alpha_sensor       # False Positive
         else:
             # Negative Detection
-            Psi = self.sensor_beta        # False Negative
-            Phi = 1.0 - self.sensor_alpha # True Negative
+            Psi = beta_sensor        # False Negative
+            Phi = 1.0 - alpha_sensor # True Negative
 
         # Calculate intermediate terms
         Omega = Psi - Phi
@@ -1057,6 +1057,60 @@ class POMCPSolver:
             new_belief_map = free_cells_mask / num_free_cells
 
         return new_belief_map
+
+
+    # Build a virtual belief map by simulating negative partner observations along future plans
+    def build_virtual_belief_map(self, current_belief_map, my_pos, partner_positions, partner_plans):
+        virtual_belief_map = current_belief_map.copy()
+
+        if not partner_positions or not partner_plans:
+            return virtual_belief_map       # If no partner information is available, return the original belief map
+
+        # Keep only partners that are not excluded by proximity+priority rule.
+        simulated_positions = {}
+        for partner_id, partner_pos in partner_positions.items():
+            dist_manhattan = abs(my_pos[0] - partner_pos[0]) + abs(my_pos[1] - partner_pos[1])
+            if not (dist_manhattan <= 4 and partner_id > self.drone_id):
+                simulated_positions[partner_id] = partner_pos
+
+        if not simulated_positions:     # If all partners are excluded by proximity+priority rule, return the original belief map
+            return virtual_belief_map
+
+        # Determine the maximum horizon for the decay of sensor parameters
+        max_horizon = 0
+        for partner_id, plan in partner_plans.items():
+            if partner_id in simulated_positions and plan:
+                max_horizon = max(max_horizon, len(plan))
+
+        if max_horizon == 0:            # If no partner has a valid plan, return the original belief map
+            return virtual_belief_map
+
+        for step_idx in range(max_horizon):
+            # t+1 uses real sensor parameters, future steps progressively degrade toward 0.5 at maximum horizon
+            progress = 0.0 if max_horizon == 1 else step_idx / (max_horizon - 1)
+            effective_alpha = self.sensor_alpha + (0.1 - self.sensor_alpha) * progress
+            effective_beta = self.sensor_beta + (0.1 - self.sensor_beta) * progress
+
+            cells_to_update = set()
+
+            for partner_id, current_pos in list(simulated_positions.items()):
+                plan = partner_plans.get(partner_id, [])
+                if step_idx >= len(plan):
+                    continue
+
+                # Simulate the partner's next position based on their plan
+                action = plan[step_idx]
+                delta = MOVES_DELTA.get(action, (0, 0))
+                next_pos = (current_pos[0] + delta[0], current_pos[1] + delta[1])
+
+                simulated_positions[partner_id] = next_pos
+                cells_to_update.add(next_pos)
+
+            # Apply negative observation update for all future simulated positions of partners (once per cell, for each step)
+            for cell in cells_to_update:
+                virtual_belief_map = self.get_updated_belief_map_with_sensors(virtual_belief_map, cell, 0, effective_alpha, effective_beta)
+
+        return virtual_belief_map
 
     
     # Extract target position for POMCP
@@ -1199,8 +1253,11 @@ def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_pla
         explored_cells=explored_cells
     )
     
-    # Execute POMCP search with provided data
-    best_action, future_plans = solver.search(belief_map, my_pos, partner_positions, partner_plans)
+    # Build virtual belief map by simulating negative partner observations along their future plans
+    virtual_belief_map = solver.build_virtual_belief_map(belief_map, my_pos, partner_positions, partner_plans)
+
+    # Execute POMCP with virtual preprocessed belief map
+    best_action, future_plans = solver.search(virtual_belief_map, my_pos, partner_positions, partner_plans)
     
     return {
         'best_action': best_action,
@@ -1585,7 +1642,7 @@ class DroneAgent:
                 else:
                     print(f"  [D{self.id}] Trace at {pos} already processed, skipping")
             elif isinstance(obs, int) and obs in [0, 1]:    # Standard Bayesian update for non-trace observations
-                self.belief_map = self.solver_tool.get_updated_belief_map(self.belief_map, pos, obs)
+                self.belief_map = self.solver_tool.get_updated_belief_map_with_sensors(self.belief_map, pos, obs, self.solver_tool.sensor_alpha, self.solver_tool.sensor_beta)
                 self.explored_cells.add(pos)
         
         # Clean buffers for next turn
