@@ -15,14 +15,14 @@ from collections import deque
 # =============================================================================
 DEFAULT_CONFIG = {
     'map_size': 20,
-    'alpha_sensor': 0.02,
-    'beta_sensor': 0.02,
-    'max_time': 2.5,
-    'depth_limit': 1000,
-    'discount_factor': 0.95,
+    'alpha_sensor': 0.03,
+    'beta_sensor': 0.03,
+    'max_time': 2,
+    'depth_limit': 50,
+    'discount_factor': 0.98,
     'exploration_const': math.sqrt(2),
-    'reward_alpha': 1,
-    'explorative_reward': 0.0025,
+    'reward_alpha': 3,
+    'explorative_reward': 0.005,
     'r_target': 1,
 }
 
@@ -1075,6 +1075,10 @@ class POMCPSolver:
 
         if not simulated_positions:     # If all partners are excluded by proximity+priority rule, return the original belief map
             return virtual_belief_map
+
+        # Apply negative observation update for current positions of partners
+        for partner_id, current_pos in simulated_positions.items():
+            virtual_belief_map = self.get_updated_belief_map_with_sensors(virtual_belief_map, current_pos, 0, self.sensor_alpha, self.sensor_beta)
 
         # Determine the maximum horizon for the decay of sensor parameters
         max_horizon = 0
