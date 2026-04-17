@@ -24,7 +24,7 @@ DEFAULT_CONFIG = {
     'reward_alpha': 3,
     'explorative_reward': 0.005,
     'r_target': 1,
-    'planning_horizon': 6,
+    'planning_horizon': 7,
     'execution_horizon': 3,
 }
 
@@ -1105,9 +1105,19 @@ class POMCPSolver:
         if not simulated_positions:     # If all partners are excluded by proximity+priority rule, return the original belief map
             return virtual_belief_map
 
-        # Apply negative observation update for current positions of partners
+        # Apply negative observation update for current positions of partners (and their adjacent cells)
         for partner_id, current_pos in simulated_positions.items():
-            virtual_belief_map = self.get_updated_belief_map_with_sensors(virtual_belief_map, current_pos, 0, self.sensor_alpha, self.sensor_beta)
+            cells_to_update = {current_pos}
+            for action, delta in MOVES_DELTA.items():
+                if action != 'Stay':
+                    nr, nc = current_pos[0] + delta[0], current_pos[1] + delta[1]
+                    if 0 <= nr < self.map_size and 0 <= nc < self.map_size and self.obstacle_map[nr, nc] == 0:
+                        cells_to_update.add((nr, nc))
+            
+            cells_to_update.discard(my_pos)
+            
+            for cell in cells_to_update:
+                virtual_belief_map = self.get_updated_belief_map_with_sensors(virtual_belief_map, cell, 0, self.sensor_alpha, self.sensor_beta)
 
         # Determine the maximum horizon for the decay of sensor parameters
         max_horizon = 0
@@ -1138,6 +1148,15 @@ class POMCPSolver:
 
                 simulated_positions[partner_id] = next_pos
                 cells_to_update.add(next_pos)
+                
+                # Add adjacent cells for the simulated next position
+                for adj_action, adj_delta in MOVES_DELTA.items():
+                    if adj_action != 'Stay':
+                        nr, nc = next_pos[0] + adj_delta[0], next_pos[1] + adj_delta[1]
+                        if 0 <= nr < self.map_size and 0 <= nc < self.map_size and self.obstacle_map[nr, nc] == 0:
+                            cells_to_update.add((nr, nc))
+
+            cells_to_update.discard(my_pos)
 
             # Apply negative observation update for all future simulated positions of partners (once per cell, for each step)
             for cell in cells_to_update:
@@ -1635,7 +1654,6 @@ class DroneAgent:
                 if obs == 1 and getattr(self, 'search_mode', None) == 'POMCP':
                     if hasattr(self, 'active_plan') and self.active_plan:
                         self.active_plan.clear()
-                        self.partner_future_plans.clear()
                         print(f"  [D{self.id}] Cleared active plan due to positive target observation at {pos}.")
         
         # Clean buffers for next turn
