@@ -13,7 +13,7 @@ DEFAULT_CONFIG = {
     'map_size': 20,
     'alpha_sensor': 0.02,
     'beta_sensor': 0.02,
-    'max_time': 2.5,
+    'max_time': 2,
     'depth_limit': 1000,
     'discount_factor': 0.95,
     'exploration_const': math.sqrt(2),
