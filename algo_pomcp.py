@@ -8,25 +8,8 @@ import numpy as np
 from scipy.stats import multivariate_normal
 import pygame
 import multiprocessing
-from scipy.stats import entropy
 
-# =============================================================================
-# 1. PARAMETERS CONFIGURATION E COSTANTI GLOBALI
-# =============================================================================
-
-DEFAULT_CONFIG = {
-    'map_size': 20,
-    'alpha_sensor': 0.01,
-    'beta_sensor': 0.01,
-    'max_time': 2.5,
-    'depth_limit': 1000,
-    'discount_factor': 0.95,
-    'exploration_const': math.sqrt(2),
-    'reward_alpha': 3,                  #DEFAULT: 1
-    'explorative_reward': 0.005,       #DEFAULT: 0.0025
-    'r_target': 1,
-}
-
+#Global constants
 MOVES_DELTA = {
     'N': (-1, 0),
     'S': (1, 0),
@@ -75,10 +58,11 @@ DARP_AREA_COLORS = [
     (224, 255, 255)
 ]
 
-# =============================================================================
-# FUNZIONI DI SUPPORTO AMBIENTE
-# =============================================================================
+DEFAULT_CONFIG = {
+    'reward_alpha': 0.8,
+}
 
+# Functions to initialize map 
 def initialize_obstacle_map(params):
     map_size = params['map_size']
     obstacle_map = np.zeros((map_size, map_size), dtype=int)
@@ -190,6 +174,11 @@ class POMCPSolver:
         self.total_nodes_created = 1 
         self.max_depth_reached = 0
 
+        # VARIABILI NUOVE PER TRACCIAMENTO
+        self.root_action_flips = 0
+        self.last_root_action = None
+        iterations = 0
+
         root = POMCPNode(belief_map=current_belief_map, parent=None)
         self.root = root 
         start_time = time.time() 
@@ -198,6 +187,7 @@ class POMCPSolver:
             if (time.time() - start_time) > self.max_time:
                 break
             
+            iterations += 1
             sampled_target_pos = self._sample_target_from_belief(root.belief_map)
             state = (sampled_target_pos, self.drone_position)
             self.simulate(state, root, 0, visited_cells=None, current_visited_cells=self.explored_cells)
@@ -205,7 +195,28 @@ class POMCPSolver:
         best_action = self._select_best_action(root)
         future_plans = self._extract_future_plans(root)
         
-        return best_action, future_plans
+        # --- CALCOLO METRICHE PER EXCEL ---
+        exploitation = root.q_value_actions.get(best_action, 0.0)
+        n_a = root.action_counts.get(best_action, 0)
+        N = root.total_node_visits
+        
+        exploration = 0.0
+        if n_a > 0 and N > 0:
+            exploration = self.c * math.sqrt(math.log(N) / n_a)
+            
+        expl_ratio = 0.0
+        if (exploration + abs(exploitation)) != 0:
+            expl_ratio = (exploration / (exploration + abs(exploitation))) * 100
+
+        metrics = {
+            'iterations': iterations,
+            'depth': self.max_depth_reached,
+            'nodes': self.total_nodes_created,
+            'expl_ratio': expl_ratio,
+            'flips': self.root_action_flips
+        }
+        
+        return best_action, future_plans, metrics
 
     def simulate(self, state, node, depth, visited_cells=None, current_visited_cells=None): 
         if visited_cells is None:
@@ -229,6 +240,13 @@ class POMCPSolver:
             return rollout_value
 
         action = self._ucb_search(node)
+        
+        # TRACCIAMENTO FLIP AZIONE AL ROOT
+        if node == self.root:
+            if self.last_root_action is not None and action != self.last_root_action:
+                self.root_action_flips += 1
+            self.last_root_action = action
+
         next_state, observation, reward, terminal = self.generative_model_G(state, action, node.belief_map, visited_cells, current_visited_cells, depth)
 
         if (action, observation) in node.children:
@@ -359,6 +377,10 @@ class POMCPSolver:
         if not simulated_positions:
             return virtual_belief_map
 
+        # Apply negative observation update for current positions of partners
+        for partner_id, current_pos in simulated_positions.items():
+            virtual_belief_map = self.get_updated_belief_map_with_sensors(virtual_belief_map, current_pos, 0, self.sensor_alpha, self.sensor_beta)
+
         max_horizon = 0
         for partner_id, plan in partner_plans.items():
             if partner_id in simulated_positions and plan:
@@ -487,13 +509,14 @@ def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_pla
         explored_cells=explored_cells
     )
     virtual_belief_map = solver.build_virtual_belief_map(belief_map, my_pos, partner_positions, partner_plans)
-    best_action, future_plans = solver.search(virtual_belief_map, my_pos, partner_positions, partner_plans)
+    best_action, future_plans, metrics = solver.search(virtual_belief_map, my_pos, partner_positions, partner_plans)
     return {
         'best_action': best_action,
         'depth': solver.max_depth_reached,
         'visits': solver.root.total_node_visits,
         'nodes_created': solver.total_nodes_created,
-        'future_plans': future_plans
+        'future_plans': future_plans,
+        'metrics': metrics
     }
 
 class TSPSolver:
@@ -1091,7 +1114,7 @@ def run_simulation(params):
     move_interval_sec = 0.0
     last_step_time = 0.0
 
-    entropy_history = []
+    all_drones_metrics = {drone.id: [] for drone in drones}
 
     try:
         while running:
@@ -1132,7 +1155,8 @@ def run_simulation(params):
                             'depth': 0,
                             'visits': 0,
                             'nodes_created': 0,
-                            'future_plans': {}
+                            'future_plans': {},
+                            'metrics': None
                         }
                         drone.future_plans_buffer = {}
 
@@ -1148,7 +1172,7 @@ def run_simulation(params):
                             drone.planned_result = results[idx]
                             drone.final_action = results[idx]['best_action']
                             drone.future_plans_buffer = results[idx]['future_plans']
-                    
+
                     intention_packets = [drone.send_intention() for drone in drones]
                     for drone in drones:
                         for pkt in intention_packets:
@@ -1187,27 +1211,26 @@ def run_simulation(params):
                         'conflict': had_conflict
                     })
 
-                render_frame(graphics_ctx, drones, target_pos, traces, ui_stats)
+                    metric = result.get('metrics', None)
+                    all_drones_metrics[drone.id].append(metric)
 
-                flat_belief = drones[0].belief_map.flatten()
-                current_entropy = entropy(flat_belief, base=2)
-                entropy_history.append(current_entropy)
+                render_frame(graphics_ctx, drones, target_pos, traces, ui_stats)
 
                 if drones[0].belief_map.max() >= 0.95:
                     print(f"\n TARGET TROVATO in {step_counter} step! (probabilità > 95%)")
                     pygame.quit()
-                    return step_counter, entropy_history
+                    return step_counter, None, all_drones_metrics
 
             graphics_ctx['clock'].tick(60)
             
             for event in pygame.event.get():
                 if event.type == pygame.QUIT: 
                     pygame.quit()
-                    return -1, []
+                    return -1, [], {}
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE: 
                         pygame.quit()
-                        return -1, []
+                        return -1, [], {}
                     if event.key == pygame.K_SPACE: 
                         auto_mode = not auto_mode
             
