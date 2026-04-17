@@ -2,10 +2,11 @@ import os
 import datetime
 import copy
 import pandas as pd
+import numpy as np
+
 
 # Import configuration modules
-from config_gui import get_user_parameters
-from config_auto import generate_random_parameters
+from config_gui import (DEFAULT_CONFIG, get_user_parameters, generate_random_parameters)
 
 # List of algorithms to test
 import algo_pomcp
@@ -21,27 +22,34 @@ ALGORITHMS = [
 def main():
     print("=== MULTI-ALGORITHM SIMULATOR ===")
     try:
-        num_scenarios = int(input("How many scenarios do you want to simulate? "))
-        print("\nHow do you want to configure the scenarios?")
-        print("1. Manually (via GUI)")
-        print("2. Automatic Procedural Generation (Random heuristics)")
+        num_scenarios = int(input("Number of scenarios to simulate: "))
+        print("\nConfiguration Method:")
+        print("1. Manual Configuration")
+        print("2. Automatic Configuration")
         scelta_config = input("Choice (1 or 2): ")
+
+        num_alphas = int(input("How many different reward_alpha values to test? "))
+        alpha_values = []
+        for i in range(num_alphas):
+            val = float(input(f"Enter the value for reward_alpha #{i+1}: "))
+            alpha_values.append(val)
+
     except ValueError:
-        print("Error: Please enter a valid integer.")
+        print("Error: Please enter a valid number.")
         return
 
-    # =========================================================================
-    # FOLDER CREATION FOR CURRENT SESSION RESULTS
-    # =========================================================================
+    # Folder creation
     base_dir = os.path.dirname(os.path.abspath(__file__))
     now = datetime.datetime.now()
-    folder_name = now.strftime("Sim_%Y-%m-%d_%H-%M-%S")
+    global_timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+    
+    folder_name = f"Sim_{global_timestamp}"
     session_folder = os.path.join(base_dir, folder_name)
     os.makedirs(session_folder, exist_ok=True)
-    print(f"\n[+] Session folder created: {session_folder}")
+    print(f"\n Session folder created: {session_folder}")
 
     # =========================================================================
-    # 1 - PARAMETER CONFIGURATION FOR ALL SCENARIOS
+    # 1 - PARAMETER CONFIGURATION FOR ALL SCENARIOS 
     # =========================================================================
     all_scenarios_params = []
     
@@ -50,7 +58,7 @@ def main():
             print(f"\n{'='*50}")
             print(f" STARTING SCENARIO CONFIGURATION {i}/{num_scenarios}")
             print(f"{'='*50}")
-            params = get_user_parameters(scenario_idx=i, save_folder=session_folder)
+            params = get_user_parameters(scenario_idx=i)
         else:
             params = generate_random_parameters(scenario_idx=i)
             
@@ -61,206 +69,231 @@ def main():
     print("="*50)
 
     # =========================================================================
-    # 2 - SIMULATION EXECUTION FOR ALL SCENARIOS AND ALGORITHMS
+    # 2 - ITERATIONS OVER ALPHA VALUES, SCENARIOS AND ALGORITHMS
     # =========================================================================
-    results_data = []
+    
+    # Loop over different reward_alpha values
+    for current_alpha in alpha_values:
+        print(f"\n\n{'#'*60}")
+        print(f" STARTING SIMULATIONS WITH REWARD_ALPHA = {current_alpha} ")
+        print(f"{'#'*60}")
 
-    # Loop for extracting parameters for each scenario
-    for params in all_scenarios_params:
-        scenario_idx = params['scenario_idx']
-        
-        # Data for excel report
-        map_type_str = "Uniform" if params['map_type'] == 1 else "Multi-Gaussian"
-        has_traces = "Yes" if len(params.get('traces', [])) > 0 else "No"
-        
-        scenario_record = {
-            "Scenario": scenario_idx,
-            "N. Drones": params['num_drones'],
-            "Map Type": map_type_str,
-            "Traces": has_traces
-        }
+        results_data = []
 
-        for algo_name, algo_module in ALGORITHMS:
-            print(f"\n Executing: {algo_name} (Scenario {scenario_idx})")
+        # Loop for extracting parameters for each scenario
+        for params in all_scenarios_params:
+            scenario_idx = params['scenario_idx']
             
-            # Deep copy to prevent overriding parameters between runs
-            current_params = copy.deepcopy(params)
-            current_params['algo_name'] = algo_name
-            current_params['save_folder'] = session_folder
-            
-            # Simulation execution: returns steps taken and list of entropy values
-            steps_taken, entropy_list = algo_module.run_simulation(current_params)
-            
-            if steps_taken == -1:
-                print(f"Simulation {algo_name} stopped by user or encountered an error.")
-                scenario_record[f"Step {algo_name}"] = "Interrupted/Error"
-                scenario_record[f"Entropy {algo_name}"] = []
-            else:
-                scenario_record[f"Step {algo_name}"] = steps_taken
-                scenario_record[f"Entropy {algo_name}"] = entropy_list
+            scenario_record = {
+                "Scenario": scenario_idx,
+                "Drone Pos": str(params.get('drone_positions', [])),
+                "Target Pos": str(params.get('target_pos', '')),
+                "Num Peaks": len(params.get('peaks', [])),
+                "Peak Means": str([p['mean'] for p in params.get('peaks', [])]),
+                "Peak Vars": str([p['cov'] for p in params.get('peaks', [])]),
+                "Obstacles": str(params.get('obstacles', [])),
+                "Step POMCP": None,
+                "Step AUCTION": None,
+                "Step GREEDY": None,
+                "pomcp_metrics": []
+            }
 
-        results_data.append(scenario_record)
+            for algo_name, algo_module in ALGORITHMS:
+                print(f"\n Executing: {algo_name} (Scenario {scenario_idx} | Alpha {current_alpha})")
+                
+                current_params = copy.deepcopy(params)
+                current_params['algo_name'] = algo_name
+                current_params['save_folder'] = session_folder
+                current_params['reward_alpha'] = current_alpha      # Set current alpha in parameters
+                
+                # Simulation execution: returns steps taken and metrics
+                res = algo_module.run_simulation(current_params)
+                steps_taken = res[0]
+                
+                # Manual interruptions 
+                if steps_taken == -1:
+                    print(f"Simulation {algo_name} stopped by user.")
+                    steps_taken = float('inf') 
+                
+                if algo_name == "DEC-POMCP":
+                    scenario_record["Step POMCP"] = steps_taken
+                    scenario_record["pomcp_metrics"] = res[2] if len(res) > 2 else []
+                elif algo_name == "AUCTION":
+                    scenario_record["Step AUCTION"] = steps_taken
+                elif algo_name == "GREEDY":
+                    scenario_record["Step GREEDY"] = steps_taken
 
-    # =========================================================================
-    # 3 - EXCEL REPORT GENERATION
-    # =========================================================================
-    generate_excel_report(results_data, session_folder)
+            results_data.append(scenario_record)
+
+        # Call to the function to generate Excel report
+        generate_excel_report(results_data, session_folder, global_timestamp, current_alpha)
 
 
-def generate_excel_report(data, session_folder):
+# Function to generate Excel report 
+def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     if not data:
         print("No data to export.")
         return
-
-    df = pd.DataFrame(data)
     
-    # Determine the winners for each scenario (handling ties)
-    algo_names = [name for name, _ in ALGORITHMS]
-    step_columns = [f"Step {name}" for name in algo_names]
+    filename = os.path.join(session_folder, f"{timestamp}_{alpha_reward}.xlsx")
     
-    winners_per_scenario = []
-    # Initialize win counts to 0 for all algorithms
-    win_counts_dict = {name: 0 for name in algo_names}
-    
-    for index, row in df.iterrows():
-        # Convert steps to numeric, ignoring "Interrupted/Error" strings
-        valid_steps = pd.to_numeric(row[step_columns], errors='coerce')
-        
-        if valid_steps.notna().any():
-            # Find the absolute minimum step value
-            min_step = valid_steps.min()
-            
-            # Get ALL columns that match this minimum value (handling ties)
-            best_cols = valid_steps[valid_steps == min_step].index.tolist()
-            
-            # Clean the names (remove "Step ")
-            scenario_winners = [col.replace("Step ", "") for col in best_cols]
-            
-            # Add +1 win to each algorithm that tied
-            for w in scenario_winners:
-                win_counts_dict[w] += 1
-                
-            # Join names for the Excel column (e.g., "AUCTION, GREEDY")
-            winners_per_scenario.append(", ".join(scenario_winners))
-        else:
-            winners_per_scenario.append("None")
-            
-    df["Winner"] = winners_per_scenario
-    
-    # Convert the dictionary back to a pandas Series to keep compatibility with the chart code
-    win_counts = pd.Series(win_counts_dict)
-    # Remove algorithms with 0 wins to keep the pie chart clean
-    win_counts = win_counts[win_counts > 0]
-
-    # Separate entropy columns from summary columns
-    entropy_columns = [col for col in df.columns if col.startswith("Entropy ")]
-    df_summary = df.drop(columns=entropy_columns)
-
-    # Creation of Excel report
-    filename = os.path.join(session_folder, "Report_Simulations.xlsx")
     writer = pd.ExcelWriter(filename, engine='xlsxwriter')
     workbook = writer.book
-    
-    # --- SHEET 1: SUMMARY AND PIE CHART ---
-    df_summary.to_excel(writer, sheet_name='Results', index=False)
-    worksheet_results = writer.sheets['Results']
-    
-    # Auto-adjust column widths
-    for i, col in enumerate(df_summary.columns):
-        column_len = max(df_summary[col].astype(str).map(len).max(), len(col)) + 2
-        worksheet_results.set_column(i, i, column_len)
 
-    # Add pie chart if there are winners
-    if not win_counts.empty and win_counts.index[0] != "None":
-        chart_data_start_row = len(df_summary) + 5
-        worksheet_results.write(chart_data_start_row, 0, "Algorithm")
-        worksheet_results.write(chart_data_start_row, 1, "Wins")
-        
-        for i, (algo, count) in enumerate(win_counts.items()):
-            worksheet_results.write(chart_data_start_row + 1 + i, 0, algo)
-            worksheet_results.write(chart_data_start_row + 1 + i, 1, count)
-
-        pie_chart = workbook.add_chart({'type': 'pie'})
-        pie_chart.add_series({
-            'name': 'Win Percentage',
-            'categories': ['Results', chart_data_start_row + 1, 0, chart_data_start_row + len(win_counts), 0],
-            'values':     ['Results', chart_data_start_row + 1, 1, chart_data_start_row + len(win_counts), 1],
-            'data_labels': {'percentage': True, 'category': True, 'separator': '\n'}
-        })
-        pie_chart.set_title({'name': 'Algorithms Win Distribution'})
-        worksheet_results.insert_chart('H2', pie_chart)
-
-    # --- SHEET 2: ENTROPY DATA AND IMPROVED LINE CHARTS ---
-    worksheet_entropy = workbook.add_worksheet('Entropy_Graphs')
+    # SHEET 1: SCENARIO PARAMETERS
+    df_params = pd.DataFrame(data)[["Scenario", "Drone Pos", "Target Pos", "Num Peaks", "Peak Means", "Peak Vars", "Obstacles"]]
+    df_params["Num Steps Map"] = DEFAULT_CONFIG['map_size'] 
+    df_params.to_excel(writer, sheet_name='Parametri', index=False)
     
-    col_offset = 0 
-    chart_row_offset = 2 
-    
-    for index, row in df.iterrows():
-        scenario_num = row['Scenario']
-        
-        # Extract entropy data into a temporary DataFrame (aligns arrays of different lengths with empty cells)
-        dict_scenario_entropies = {}
-        for col in entropy_columns:
-            algo_name = col.replace("Entropy ", "")
-            dict_scenario_entropies[algo_name] = pd.Series(row[col]) 
-            
-        df_ent = pd.DataFrame(dict_scenario_entropies)
-        
-        # Write raw data to the sheet
-        worksheet_entropy.write(0, col_offset, f"Data Scenario {scenario_num}")
-        df_ent.to_excel(writer, sheet_name='Entropy_Graphs', startrow=1, startcol=col_offset, index=False)
-        
-        # Calculate min/max for Y-axis zoom
-        min_entropy = df_ent.min().min()
-        max_entropy = df_ent.max().max()
-        margin = (max_entropy - min_entropy) * 0.05
-        if pd.isna(margin) or margin == 0:
-            margin = 0.5
-            
-        y_min = max(0, min_entropy - margin)
-        y_max = max_entropy + margin
+    worksheet_param = writer.sheets['Parametri']
+    for i, col in enumerate(df_params.columns):
+        column_len = max(df_params[col].astype(str).map(len).max(), len(col)) + 2
+        worksheet_param.set_column(i, i, column_len)
 
-        line_chart = workbook.add_chart({'type': 'line'})
+    # SHEET 2: ALGORITHM PERFORMANCE AND WINNERS
+    performance_records = []
+    win_counts = {"DEC-POMCP": 0, "AUCTION": 0, "GREEDY": 0}
+    
+    for row in data:
+        steps_dict = {
+            "DEC-POMCP": row["Step POMCP"],
+            "AUCTION": row["Step AUCTION"],
+            "GREEDY": row["Step GREEDY"]
+        }
         
-        line_styles = ['solid', 'dash', 'dot', 'dash_dot']
-        markers = ['circle', 'square', 'triangle', 'diamond']
+        valid_steps = {k: v for k, v in steps_dict.items() if v != float('inf') and v is not None}
         
-        # Add a series for each tested algorithm
-        for i, col_name in enumerate(df_ent.columns):
-            num_rows = len(df_ent[col_name].dropna()) 
+        if valid_steps:
+            min_step = min(valid_steps.values())
+            winners = [k for k, v in valid_steps.items() if v == min_step]
+            for w in winners:
+                win_counts[w] += 1
+            winner_str = ", ".join(winners)
+        else:
+            winner_str = "Nessuno (Interrotto)"
+
+        rec = {"Scenario": row["Scenario"]}
+        rec.update({k: (v if v != float('inf') else "Interrotto") for k,v in steps_dict.items()})
+        rec["Vincitori"] = winner_str
+        performance_records.append(rec)
+
+    total_row = {"Scenario": "TOTALE VITTORIE"}
+    total_row.update(win_counts)
+    total_row["Vincitori"] = ""
+    performance_records.append(total_row)
+
+    df_perf = pd.DataFrame(performance_records)
+    df_perf.to_excel(writer, sheet_name='Performance', index=False)
+    worksheet_perf = writer.sheets['Performance']
+    for i, col in enumerate(df_perf.columns):
+        worksheet_perf.set_column(i, i, max(len(col)+2, 15))
+
+    # SHEET 3: POMCP METRICS FOR DRONE 1
+    metrics_records = []
+    for row in data:
+        all_metrics = row["pomcp_metrics"]
+        # Recupera solo i dati del Drone 1 (escludendo i None del TSP)
+        if all_metrics and 1 in all_metrics:
+            m_list = [m for m in all_metrics[1] if m is not None]
+            if m_list:
+                iters = [m['iterations'] for m in m_list]
+                depths = [m['depth'] for m in m_list]
+                nodes = [m['nodes'] for m in m_list]
+                
+                metrics_records.append({
+                    "Scenario": row["Scenario"],
+                    "Iterazioni Min": np.min(iters),
+                    "Iterazioni Max": np.max(iters),
+                    "Iterazioni Medie": round(np.mean(iters), 2),
+                    "Depth Min": np.min(depths),
+                    "Depth Max": np.max(depths),
+                    "Depth Media": round(np.mean(depths), 2),
+                    "Nodi Min": np.min(nodes),
+                    "Nodi Max": np.max(nodes),
+                    "Nodi Medi": round(np.mean(nodes), 2)
+                })
+            else:
+                metrics_records.append({"Scenario": row["Scenario"]})
+        else:
+            metrics_records.append({"Scenario": row["Scenario"]})
             
-            line_chart.add_series({
-                'name':       ['Entropy_Graphs', 1, col_offset + i],
-                'values':     ['Entropy_Graphs', 2, col_offset + i, 1 + num_rows, col_offset + i],
-                'marker':     {'type': markers[i % len(markers)], 'size': 5},
-                'line':       {'width': 2.25, 'dash_type': line_styles[i % len(line_styles)]}
-            })
+    df_metrics = pd.DataFrame(metrics_records)
+    df_metrics.to_excel(writer, sheet_name='Metrics_Drone1', index=False)
+    worksheet_met = writer.sheets['Metrics_Drone1']
+    for i, col in enumerate(df_metrics.columns):
+        worksheet_met.set_column(i, i, max(len(col)+2, 12))
+
+    # Helper function to create diagrams in excel
+    def create_spaced_chart_sheet(sheet_name, data, metric_key, chart_title, y_axis_name):
+        ws = workbook.add_worksheet(sheet_name)
+        row_offset = 0
+        
+        for row in data:
+            scenario = row["Scenario"]
+            metrics_dict = row["pomcp_metrics"]
             
-        line_chart.set_title({'name': f'Entropy Trend - Scenario {scenario_num}'})
-        line_chart.set_x_axis({
-            'name': 'Steps', 
-            'major_gridlines': {'visible': True}
-        })
-        line_chart.set_y_axis({
-            'name': 'Entropy (Bits)',
-            'min': y_min,
-            'max': y_max,
-            'num_format': '0.000'
-        })
-        line_chart.set_size({'width': 750, 'height': 400})
-        
-        # Insert the chart next to the raw data
-        worksheet_entropy.insert_chart(chart_row_offset, col_offset + len(df_ent.columns) + 2, line_chart)
-        
-        # Update offsets for the next scenario
-        chart_row_offset += 18 
-        col_offset += len(df_ent.columns) + 1 
+            if not metrics_dict:
+                continue
+                
+            # Find max number of steps for the current scenario across all drones to set chart range
+            max_steps = max((len(m_list) for m_list in metrics_dict.values()), default=0)
+            if max_steps == 0:
+                continue
+                
+            # Write scenario title and step headers
+            ws.write(row_offset, 0, f"Scenario {scenario}")
+            for step_idx in range(max_steps):
+                ws.write(row_offset, step_idx + 1, f"Step {step_idx+1}")
+            
+            # Build chart 
+            chart = workbook.add_chart({'type': 'line'})
+            
+            current_row = row_offset + 1
+            
+            # Write data for each drone and add series to the chart
+            for drone_id, m_list in metrics_dict.items():
+                ws.write(current_row, 0, f"Drone {drone_id}")
+                
+                vals = [m.get(metric_key) if m is not None else None for m in m_list]
+                
+                for col_idx, val in enumerate(vals):
+                    if val is not None:
+                        ws.write(current_row, col_idx + 1, round(val, 2))
+                
+                # Add series to the chart for this drone
+                chart.add_series({
+                    'name': f'Drone {drone_id}',
+                    'categories': [sheet_name, row_offset, 1, row_offset, max_steps],
+                    'values': [sheet_name, current_row, 1, current_row, max_steps],
+                    'marker': {'type': 'circle', 'size': 4},
+                    'line': {'width': 1.5}
+                })
+                
+                current_row += 1
+            
+            # Chart formatting
+            chart.set_title({'name': f'{chart_title} - Scenario {scenario}'})
+            chart.set_x_axis({'name': 'Time Steps (Global)'})
+            chart.set_y_axis({'name': y_axis_name})
+            chart.set_size({'width': 700, 'height': 350})
+            
+            # Chart positioning 
+            ws.insert_chart(current_row + 1, 1, chart)
+            
+            # Add space
+            row_offset = current_row + 22
+
+    # SHEET 4: EXPLORATION RATIO 
+    create_spaced_chart_sheet('Expl_Ratio', data, 'expl_ratio', 'Exploration vs Exploitation Ratio', 'Ratio %')
+
+    # SHEET 5: ROOT ACTION FLIPS 
+    create_spaced_chart_sheet('Root_Flips', data, 'flips', 'Variazioni Azione al Root', 'Numero Flips')
 
     writer.close()
     print(f"\n{'='*50}")
-    print(f"Simulation completed! Data saved in folder:\n{session_folder}")
+    print(f"Simulation completed! Report Excel saved as:\n{filename}")
     print(f"{'='*50}")
+
 
 if __name__ == "__main__":
     main()
