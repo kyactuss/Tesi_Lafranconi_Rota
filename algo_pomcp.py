@@ -58,10 +58,6 @@ DARP_AREA_COLORS = [
     (224, 255, 255)
 ]
 
-DEFAULT_CONFIG = {
-    'reward_alpha': 0.8,
-}
-
 # Functions to initialize map 
 def initialize_obstacle_map(params):
     map_size = params['map_size']
@@ -1149,7 +1145,7 @@ def run_simulation(params):
                             drone.final_action = action
                         else:
                             drone.final_action = 'Stay'
-                            
+                        
                         drone.planned_result = {
                             'best_action': drone.final_action,
                             'depth': 0,
