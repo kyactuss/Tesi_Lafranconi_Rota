@@ -10,11 +10,13 @@ from config_gui import (DEFAULT_CONFIG, get_user_parameters, generate_random_par
 
 # List of algorithms to test
 import algo_pomcp
+import algo_pomcp_shr  # IMPORT DEL NUOVO ALGORITMO
 import algo_auction
 import algo_greedy
 
 ALGORITHMS = [
     ("DEC-POMCP", algo_pomcp),
+    ("SHR-POMCP", algo_pomcp_shr),
     ("AUCTION", algo_auction),
     ("GREEDY", algo_greedy)
 ]
@@ -93,9 +95,11 @@ def main():
                 "Peak Vars": str([p['cov'] for p in params.get('peaks', [])]),
                 "Obstacles": str(params.get('obstacles', [])),
                 "Step POMCP": None,
+                "Step SHR-POMCP": None,
                 "Step AUCTION": None,
                 "Step GREEDY": None,
-                "pomcp_metrics": []
+                "pomcp_metrics": [],
+                "shr_pomcp_metrics": []
             }
 
             for algo_name, algo_module in ALGORITHMS:
@@ -118,6 +122,9 @@ def main():
                 if algo_name == "DEC-POMCP":
                     scenario_record["Step POMCP"] = steps_taken
                     scenario_record["pomcp_metrics"] = res[2] if len(res) > 2 else []
+                elif algo_name == "SHR-POMCP":
+                    scenario_record["Step SHR-POMCP"] = steps_taken
+                    scenario_record["shr_pomcp_metrics"] = res[2] if len(res) > 2 else []
                 elif algo_name == "AUCTION":
                     scenario_record["Step AUCTION"] = steps_taken
                 elif algo_name == "GREEDY":
@@ -152,11 +159,12 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
 
     # SHEET 2: ALGORITHM PERFORMANCE AND WINNERS
     performance_records = []
-    win_counts = {"DEC-POMCP": 0, "AUCTION": 0, "GREEDY": 0}
+    win_counts = {"DEC-POMCP": 0, "SHR-POMCP": 0, "AUCTION": 0, "GREEDY": 0}
     
     for row in data:
         steps_dict = {
             "DEC-POMCP": row["Step POMCP"],
+            "SHR-POMCP": row["Step SHR-POMCP"],
             "AUCTION": row["Step AUCTION"],
             "GREEDY": row["Step GREEDY"]
         }
@@ -188,34 +196,38 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     for i, col in enumerate(df_perf.columns):
         worksheet_perf.set_column(i, i, max(len(col)+2, 15))
 
-    # SHEET 3: POMCP METRICS FOR DRONE 1
+    # SHEET 3: POMCP METRICS FOR DRONE 1 (DOPPIA RIGA PER SCENARIO)
     metrics_records = []
     for row in data:
-        all_metrics = row["pomcp_metrics"]
-        # Recupera solo i dati del Drone 1 (escludendo i None del TSP)
-        if all_metrics and 1 in all_metrics:
-            m_list = [m for m in all_metrics[1] if m is not None]
-            if m_list:
-                iters = [m['iterations'] for m in m_list]
-                depths = [m['depth'] for m in m_list]
-                nodes = [m['nodes'] for m in m_list]
-                
-                metrics_records.append({
-                    "Scenario": row["Scenario"],
-                    "Iterazioni Min": np.min(iters),
-                    "Iterazioni Max": np.max(iters),
-                    "Iterazioni Medie": round(np.mean(iters), 2),
-                    "Depth Min": np.min(depths),
-                    "Depth Max": np.max(depths),
-                    "Depth Media": round(np.mean(depths), 2),
-                    "Nodi Min": np.min(nodes),
-                    "Nodi Max": np.max(nodes),
-                    "Nodi Medi": round(np.mean(nodes), 2)
-                })
+        scenario_num = row["Scenario"]
+        
+        # Iteriamo sui due algoritmi per estrarre le metriche su due righe
+        for algo_label, metric_key in [("DEC-POMCP", "pomcp_metrics"), ("SHR-POMCP", "shr_pomcp_metrics")]:
+            all_metrics = row[metric_key]
+            
+            if all_metrics and 1 in all_metrics:
+                m_list = [m for m in all_metrics[1] if m is not None]
+                if m_list:
+                    iters = [m['iterations'] for m in m_list]
+                    depths = [m['depth'] for m in m_list]
+                    nodes = [m['nodes'] for m in m_list]
+                    
+                    metrics_records.append({
+                        "Scenario": f"{scenario_num} ({algo_label})",
+                        "Iterazioni Min": np.min(iters),
+                        "Iterazioni Max": np.max(iters),
+                        "Iterazioni Medie": round(np.mean(iters), 2),
+                        "Depth Min": np.min(depths),
+                        "Depth Max": np.max(depths),
+                        "Depth Media": round(np.mean(depths), 2),
+                        "Nodi Min": np.min(nodes),
+                        "Nodi Max": np.max(nodes),
+                        "Nodi Medi": round(np.mean(nodes), 2)
+                    })
+                else:
+                    metrics_records.append({"Scenario": f"{scenario_num} ({algo_label})"})
             else:
-                metrics_records.append({"Scenario": row["Scenario"]})
-        else:
-            metrics_records.append({"Scenario": row["Scenario"]})
+                metrics_records.append({"Scenario": f"{scenario_num} ({algo_label})"})
             
     df_metrics = pd.DataFrame(metrics_records)
     df_metrics.to_excel(writer, sheet_name='Metrics_Drone1', index=False)
@@ -223,14 +235,14 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     for i, col in enumerate(df_metrics.columns):
         worksheet_met.set_column(i, i, max(len(col)+2, 12))
 
-    # Helper function to create diagrams in excel
-    def create_spaced_chart_sheet(sheet_name, data, metric_key, chart_title, y_axis_name):
+    # Helper function to create diagrams in excel, accetta ora data_source_key per distinguere DEC e SHR
+    def create_spaced_chart_sheet(sheet_name, data, metric_key, chart_title, y_axis_name, data_source_key):
         ws = workbook.add_worksheet(sheet_name)
         row_offset = 0
         
         for row in data:
             scenario = row["Scenario"]
-            metrics_dict = row["pomcp_metrics"]
+            metrics_dict = row[data_source_key]
             
             if not metrics_dict:
                 continue
@@ -283,11 +295,13 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
             # Add space
             row_offset = current_row + 22
 
-    # SHEET 4: EXPLORATION RATIO 
-    create_spaced_chart_sheet('Expl_Ratio', data, 'expl_ratio', 'Exploration vs Exploitation Ratio', 'Ratio %')
+    # SHEET 4 & 5: DEC-POMCP
+    create_spaced_chart_sheet('Expl_Ratio', data, 'expl_ratio', 'Exploration vs Exploitation (DEC-POMCP)', 'Ratio %', 'pomcp_metrics')
+    create_spaced_chart_sheet('Root_Flips', data, 'flips', 'Variazioni Azione Root (DEC-POMCP)', 'Numero Flips', 'pomcp_metrics')
 
-    # SHEET 5: ROOT ACTION FLIPS 
-    create_spaced_chart_sheet('Root_Flips', data, 'flips', 'Variazioni Azione al Root', 'Numero Flips')
+    # SHEET 6 & 7: SHR-POMCP
+    create_spaced_chart_sheet('Expl_Ratio_SHR', data, 'expl_ratio', 'Exploration vs Exploitation (SHR-POMCP)', 'Ratio %', 'shr_pomcp_metrics')
+    create_spaced_chart_sheet('Root_Flips_SHR', data, 'flips', 'Variazioni Azione Root (SHR-POMCP)', 'Numero Flips', 'shr_pomcp_metrics')
 
     writer.close()
     print(f"\n{'='*50}")
