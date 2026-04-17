@@ -6,19 +6,11 @@ import random
 import time
 import numpy as np
 from scipy.stats import multivariate_normal
-from scipy.stats import entropy  
 import pygame
 import os
 
-# =============================================================================
-# 1. PARAMETERS CONFIGURATION & COSTANTI GLOBALI
-# =============================================================================
-DEFAULT_CONFIG = {
-    'map_size': 20,
-    'alpha_sensor': 0.01,
-    'beta_sensor': 0.01,
-}
 
+# Global constants
 MOVES_DELTA = {
     'N': (-1, 0),
     'S': (1, 0),
@@ -67,9 +59,7 @@ DARP_AREA_COLORS = [
     (224, 255, 255)
 ]
 
-# =============================================================================
-# FUNZIONI DI SUPPORTO AMBIENTE
-# =============================================================================
+# Functions to initialize map 
 
 def initialize_obstacle_map(params):
     map_size = params['map_size']
@@ -708,8 +698,6 @@ def run_simulation(params):
     move_interval_sec = 0.0    # Simulazione rapida
     last_step_time = 0.0
     
-    entropy_history = []       # Vettore per storicizzare l'entropia
-
     while running:
         if auto_mode and (time.monotonic() - last_step_time) >= move_interval_sec:
             last_step_time = time.monotonic()
@@ -767,15 +755,10 @@ def run_simulation(params):
 
             render_frame(graphics_ctx, drones, target_pos, traces, step_counter)
 
-            # Calcolo entropia mappa e aggiunta alla cronologia
-            flat_belief = drones[0].belief_map.flatten()
-            current_entropy = entropy(flat_belief, base=2)
-            entropy_history.append(current_entropy)
-
             if drones[0].belief_map.max() >= 0.95:
                 print(f"\n TARGET TROVATO in {step_counter} step! (probabilità > 95%)")
                 pygame.quit()
-                return step_counter, entropy_history
+                return step_counter, None
         
         graphics_ctx['clock'].tick(60)
         
