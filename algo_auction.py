@@ -6,18 +6,9 @@ import time
 import numpy as np
 from scipy.stats import multivariate_normal
 import pygame
-from scipy.stats import entropy
 
-# =============================================================================
-# 1. PARAMETERS CONFIGURATION & COSTANTI GLOBALI
-# =============================================================================
 
-DEFAULT_CONFIG = {
-    'map_size': 20,
-    'alpha_sensor': 0.01,
-    'beta_sensor': 0.01
-}
-
+# Global constants
 MOVES_DELTA = {
     'N': (-1, 0),
     'S': (1, 0),
@@ -66,10 +57,7 @@ DARP_AREA_COLORS = [
     (224, 255, 255)
 ]
 
-# =============================================================================
-# FUNZIONI DI SUPPORTO AMBIENTE
-# =============================================================================
-
+# Functions to initialize map 
 def initialize_obstacle_map(params):
     map_size = params['map_size']
     obstacle_map = np.zeros((map_size, map_size), dtype=int)
@@ -873,8 +861,6 @@ def run_simulation(params):
     move_interval_sec = 0.0     # Impostato a 0.0 per simulazione rapida
     last_step_time = 0.0
 
-    entropy_history = []
-
     # MAIN LOOP
     while running:
         
@@ -940,15 +926,11 @@ def run_simulation(params):
 
             render_frame(graphics_ctx, drones, target_pos, traces)
 
-            flat_belief = drones[0].belief_map.flatten()
-            current_entropy = entropy(flat_belief, base=2)
-            entropy_history.append(current_entropy)
-
             # Simulation termination condition
             if drones[0].belief_map.max() >= 0.95:
                 print(f"\n TARGET TROVATO in {step_counter} step! (probabilità > 95%)")
                 pygame.quit()          # Chiudi la finestra Pygame
-                return step_counter, entropy_history    # Ritorna il numero di passi compiuti all'orchestratore
+                return step_counter, None    # Ritorna il numero di passi compiuti all'orchestratore
         
         graphics_ctx['clock'].tick(60)
         
