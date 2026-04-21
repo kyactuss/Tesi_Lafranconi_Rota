@@ -19,15 +19,28 @@ MOVES_DELTA = {
 }
 
 COLORS = {
-    'WHITE': (255, 255, 255), 'BLACK': (0, 0, 0), 'GRAY': (200, 200, 200),
-    'LIGHT_GRAY': (240, 240, 240), 'BLUE': (50, 100, 255), 'RED': (255, 50, 50),
-    'GREEN': (0, 200, 0), 'PURPLE': (200, 50, 255), 'ORANGE': (255, 140, 0),
-    'LIGHT_BLUE': (0, 0, 255), 'LIGHT_RED': (200, 0, 0)
+    'WHITE': (255, 255, 255), 
+    'BLACK': (0, 0, 0), 
+    'GRAY': (200, 200, 200),
+    'LIGHT_GRAY': (240, 240, 240), 
+    'BLUE': (50, 100, 255), 
+    'RED': (255, 50, 50),
+    'GREEN': (0, 200, 0), 
+    'PURPLE': (200, 50, 255), 
+    'ORANGE': (255, 140, 0),
+    'LIGHT_BLUE': (0, 0, 255), 
+    'LIGHT_RED': (200, 0, 0)
 }
 
 DARP_AREA_COLORS = [
-    (144, 238, 144), (255, 160, 160), (216, 191, 216), (173, 216, 230),
-    (255, 255, 204), (210, 180, 140), (211, 211, 211), (255, 218, 185)
+    (144, 238, 144), 
+    (255, 160, 160), 
+    (216, 191, 216), 
+    (173, 216, 230),
+    (255, 255, 204), 
+    (210, 180, 140), 
+    (211, 211, 211), 
+    (255, 218, 185)
 ]
 
 def initialize_obstacle_map(params):
@@ -118,7 +131,7 @@ def precompute_BFS_distances(map_size, obstacle_map):
 
 
 # =============================================================================
-# 2. CENTRALIZED POMCP LOGIC 
+# CENTRALIZED POMCP LOGIC 
 # =============================================================================
 
 class POMCPNode:
@@ -153,7 +166,6 @@ class POMCPSolver:
         self.total_nodes_created = 1
         self.max_depth_reached = 0
         
-        # --- NEW METRICS ---
         self.root_action_flips = 0
         self.last_root_action = None
         iterations = 0
@@ -174,7 +186,7 @@ class POMCPSolver:
         
         best_action = self._select_best_action(root)
         
-        # --- EXCEL METRICS CALCULATION ---
+        # Excel metrics calculation
         exploitation = root.q_value_actions.get(best_action, 0.0)
         n_a = root.action_counts.get(best_action, 0)
         N = root.total_node_visits
@@ -213,7 +225,7 @@ class POMCPSolver:
 
         if node.is_leaf():
             self.expand(node, state)
-            if not node.action_counts: # Stallo totale
+            if not node.action_counts: 
                 return -100.0
             rollout_value = self.rollout(state)
             node.total_node_visits += 1
@@ -221,7 +233,7 @@ class POMCPSolver:
 
         action = self._ucb_search(node)
         
-        # --- TRACK ROOT FLIPS ---
+        # Root flips tracking
         if node == self.root:
             if self.last_root_action is not None and action != self.last_root_action:
                 self.root_action_flips += 1
@@ -233,7 +245,7 @@ class POMCPSolver:
             child_node = node.children[(action, observation)]
         else:
             _, next_drones_pos = next_state
-            # Aggiornamento bayesiano cumulativo per l'osservazione congiunta
+            # Bayesian update 
             new_belief = node.belief_map.copy()
             for i, obs in enumerate(observation):
                 new_belief = get_updated_belief_map_with_sensors(new_belief, next_drones_pos[i], obs, self.sensor_alpha, self.sensor_beta, self.obstacle_map)
@@ -259,7 +271,7 @@ class POMCPSolver:
         _, drones_pos = state
         actions = list(MOVES_DELTA.keys())
         
-        # Genera azioni congiunte
+        # Generate all possible joint actions
         for joint_action in itertools.product(actions, repeat=self.num_drones):
             next_positions = []
             valid = True
@@ -277,11 +289,11 @@ class POMCPSolver:
             
             if not valid: continue
             
-            # Controllo collisioni (2 droni nella stessa cella)
+            # Check collisions 
             if len(set(next_positions)) != self.num_drones:
                 continue
                 
-            # Controllo swap
+            # Check swaps
             swap = False
             for i in range(self.num_drones):
                 for j in range(i+1, self.num_drones):
@@ -296,7 +308,6 @@ class POMCPSolver:
     def rollout(self, state):
         target_pos, drones_pos = state
         
-        # 1. Calcoliamo tutte le distanze reali tramite BFS
         distances = []
         for pos in drones_pos:
             dist = self.dist_BFS.get((pos, target_pos), float('inf'))
@@ -304,7 +315,6 @@ class POMCPSolver:
             
         score = 0.0
         
-        # 3. Calcoliamo il valore atteso considerando i tentativi successivi
         for dist in distances:
             if dist == float('inf'):
                 break
@@ -384,7 +394,7 @@ class POMCPSolver:
 
 
 # =============================================================================
-# 3. CENTRALIZED BELIEF FUSION & AGENTS
+# CENTRALIZED BELIEF FUSION & AGENTS
 # =============================================================================
 
 def apply_trace_distribution(belief_map, trace_obs, params, obstacle_map):
@@ -441,6 +451,10 @@ def get_updated_belief_map_with_sensors(current_belief, pos, obs, alpha, beta, o
     return new_belief
 
 
+# =============================================================================
+# DRONE AGENT 
+# =============================================================================
+
 class DroneAgent:
     def __init__(self, drone_id, start_pos, params):
         self.id = drone_id
@@ -448,7 +462,7 @@ class DroneAgent:
         self.params = params
         self.observation = None
         self.positive_obs_count = 0
-        self.tsp_plan = deque()
+        self.tsp_plan = deque(self.params.get('tsp_plans', {}).get(self.id, []))
 
     def execute_move(self, action):
         d = MOVES_DELTA.get(action, (0, 0))
@@ -473,94 +487,8 @@ class DroneAgent:
                 self.observation = 1 if np.random.rand() < self.params['alpha_sensor'] else 0
 
 
-class TSPSolver:
-    def __init__(self, map_size, obstacle_map, drone_id, start_pos, darp_matrix):
-        self.map_size = map_size
-        self.obstacle_map = obstacle_map
-        self.drone_id = drone_id
-        self.start_pos = start_pos
-        self.darp_matrix = darp_matrix
-    
-    def generate_full_plan(self):
-        local_obstacle_map = np.copy(self.obstacle_map)
-        free_cells = []
-        
-        for r in range(self.map_size):
-            for c in range(self.map_size):
-                if self.darp_matrix[r, c] == self.drone_id - 1 and self.obstacle_map[r, c] == 0:
-                    free_cells.append((r, c))
-                else:
-                    local_obstacle_map[r, c] = 1
-                    
-        if self.start_pos not in free_cells:
-            free_cells.insert(0, self.start_pos)
-            local_obstacle_map[self.start_pos[0], self.start_pos[1]] = 0
-            
-        num_free_cells = len(free_cells)
-
-        if num_free_cells <= 1:
-            return []
-            
-        bfs_distances = precompute_BFS_distances(self.map_size, local_obstacle_map)
-                
-        elk_matrix = [[0] * num_free_cells for _ in range(num_free_cells)]
-        for i in range(num_free_cells):
-            for j in range(num_free_cells):
-                pos_i = free_cells[i]
-                pos_j = free_cells[j]
-                if i == j:
-                    elk_matrix[i][j] = 0
-                else:
-                    elk_matrix[i][j] = int(bfs_distances.get((pos_i, pos_j), 999999))
-        
-        try:
-            tour_indices = elkai.solve_int_matrix(elk_matrix)
-        except Exception as e:
-            print(f"  [D{self.drone_id}] Error in elkai solver: {e}")
-            return []
-            
-        start_idx = free_cells.index(self.start_pos)
-        if start_idx in tour_indices:
-            idx_in_tour = tour_indices.index(start_idx)
-            ordered_tour = tour_indices[idx_in_tour:] + tour_indices[:idx_in_tour]
-        else:
-            ordered_tour = tour_indices
-            
-        ordered_tour.append(ordered_tour[0])
-            
-        actions = []
-        current_pos = free_cells[ordered_tour[0]]
-        
-        for next_node_idx in ordered_tour[1:]:
-            next_pos = free_cells[next_node_idx]
-            
-            while current_pos != next_pos:
-                best_action = None
-                best_next = None
-                min_d = float('inf')
-                
-                for action, delta in MOVES_DELTA.items():
-                    if action == 'Stay':
-                        continue
-                    nr, nc = current_pos[0] + delta[0], current_pos[1] + delta[1]
-                    if 0 <= nr < self.map_size and 0 <= nc < self.map_size and local_obstacle_map[nr, nc] == 0:
-                        d = bfs_distances.get((next_pos, (nr, nc)), float('inf'))
-                        if d < min_d:
-                            min_d = d
-                            best_action = action
-                            best_next = (nr, nc)
-                            
-                if best_action is None:
-                    break  
-                    
-                actions.append(best_action)
-                current_pos = best_next
-                
-        return actions
-
-
 # =============================================================================
-# 4. GRAPHIC FUNCTIONS 
+# GRAPHIC FUNCTIONS 
 # =============================================================================
 
 def init_graphics(params):
@@ -595,7 +523,7 @@ def init_graphics(params):
         'spacing': spacing
     }
 
-def draw_static_background(graphics_ctx, global_belief_map, drones):
+def draw_static_background(graphics_ctx, global_belief_map, drones, global_mode):
     surface = graphics_ctx['background_surface']
     cell_size = graphics_ctx['CELL_SIZE']
     font_cell = graphics_ctx['font_cell']
@@ -611,8 +539,6 @@ def draw_static_background(graphics_ctx, global_belief_map, drones):
 
     surface.fill(COLORS['WHITE'])
 
-    is_pomcp_mode = any(getattr(drone, 'tsp_plan', None) == [] for drone in drones)
-
     for r in range(map_size):
         for c in range(map_size):
             x = c * cell_size
@@ -622,7 +548,7 @@ def draw_static_background(graphics_ctx, global_belief_map, drones):
             if obstacle_map is not None and obstacle_map[r, c] == 1:
                 color = COLORS['BLACK']
             else:
-                if not is_pomcp_mode and darp_matrix is not None and (darp_matrix[r, c] != -1 or (r, c) in drone_start_positions):
+                if global_mode == 'TSP' and darp_matrix is not None and (darp_matrix[r, c] != -1 or (r, c) in drone_start_positions):
                     if darp_matrix[r, c] != -1:
                         drone_idx = darp_matrix[r, c]
                     else:
@@ -711,7 +637,7 @@ def draw_elements(graphics_ctx, global_belief_map, drones, target_pos, traces, s
         screen.blit(font_sidebar.render(f"Action: {stats['drones'][drone.id].get('best', '-')}", True, COLORS['BLACK']), (GRID_WIDTH + 5, y_offset))
         y_offset += spacing + 10
 
-    # Elementi fissi in basso
+    # Fixed elements at the bottom
     screen_height = screen.get_height()
     controls_y = screen_height - 26
     screen.blit(font_sidebar_fixed.render("SPAZIO: Avvia/Pausa  |  R: Riavvia  |  ESC: Esci", True, COLORS['BLACK']), (GRID_WIDTH + 10, controls_y))
@@ -785,8 +711,8 @@ def draw_tsp_paths(graphics_ctx, drones):
                 
     if has_paths: screen.blit(overlay, (0, 0))
 
-def render_frame(graphics_ctx, global_belief_map, drones, target_pos, traces, ui_stats):
-    draw_static_background(graphics_ctx, global_belief_map, drones)
+def render_frame(graphics_ctx, global_belief_map, drones, target_pos, traces, ui_stats, global_mode):
+    draw_static_background(graphics_ctx, global_belief_map, drones, global_mode)
     graphics_ctx['screen'].fill(COLORS['WHITE'])
     graphics_ctx['screen'].blit(graphics_ctx['background_surface'], (0, 0))
     
@@ -797,7 +723,7 @@ def render_frame(graphics_ctx, global_belief_map, drones, target_pos, traces, ui
 
 
 # =============================================================================
-# 5. MAIN LOOP
+# MAIN LOOP
 # =============================================================================
 
 def run_simulation(params):
@@ -823,18 +749,13 @@ def run_simulation(params):
     drones = [DroneAgent(i+1, params['drone_positions'][i], params) for i in range(num_drones)]
     centralized_solver = POMCPSolver(params, obstacle_map, dist_BFS)
 
-    if global_mode == 'TSP':
-        for drone in drones:
-            tsp = TSPSolver(params['map_size'], obstacle_map, drone.id, drone.pos, params.get('darp_assignment'))
-            drone.tsp_plan.extend(tsp.generate_full_plan())
-
     running = True
-    auto_mode = True # Default True per la modalità headless
+    auto_mode = True 
     step_counter = 0
-    move_interval_sec = 0.0 # Velocità massima
+    move_interval_sec = 0.0 
     last_step_time = 0.0
     
-    # LISTA UNICA PER LE METRICHE DEL TEAM CENTRALIZZATO
+    # List for metrics 
     centralized_metrics = []
 
     while running:
@@ -848,12 +769,11 @@ def run_simulation(params):
             
             if global_mode == 'TSP' and all(len(d.tsp_plan) == 0 for d in drones):
                 global_mode = 'POMCP'
-                print("Tutti i piani TSP completati. Ritorno alla ricerca centralizzata POMCP.")
             
             joint_action = []
-            current_metric = None # Metriche per questo step
+            current_metric = None 
             
-            # Pianificazione Azioni
+            # Actions planning
             if global_mode == 'TSP':
                 for drone in drones:
                     if drone.observation == 1:
@@ -869,24 +789,22 @@ def run_simulation(params):
                     else:
                         joint_action.append('Stay')
                         
-                # Nessuna metrica Monte Carlo durante il TSP
                 current_metric = None
 
             elif global_mode == 'POMCP':
                 current_positions = [d.pos for d in drones]
-                # Estrazione azione e metriche dal solver
+
                 joint_action, current_metric = centralized_solver.search(global_belief_map.copy(), current_positions, global_explored_cells)
 
-            # Salvataggio delle metriche di questo turno
             centralized_metrics.append(current_metric)
 
-            # Esecuzione Fisica e Percezione Sensori
+            # Physical execution of actions and observation collection
             for i, drone in enumerate(drones):
                 drone.execute_move(joint_action[i])
                 drone.get_real_observation(target_pos, traces, global_discovered_traces)
                 global_explored_cells.add(drone.pos)
 
-            # Aggiornamento Centralizzato della Mappa
+            # Centralized belief fusion
             for drone in drones:
                 obs = drone.observation
                 
@@ -899,22 +817,26 @@ def run_simulation(params):
                             global_mode = 'POMCP'
                             for d in drones: 
                                 d.tsp_plan.clear()
-                            print(f"[!] Traccia rilevata da Drone {drone.id}! Switch immediato a modalità POMCP.")
                 
                 elif isinstance(obs, int):
                     global_belief_map = get_updated_belief_map_with_sensors(
                         global_belief_map, drone.pos, obs, params['alpha_sensor'], params['beta_sensor'], obstacle_map
                     )
 
-            # Condizione di Vittoria
+            # Winning condition check
             if global_belief_map.max() >= 0.95:
-                print(f"\n🏆 TARGET TROVATO CON SUCCESSO in {step_counter} steps! (Probabilità: {global_belief_map.max()*100:.1f}%)")
+                print(f"\nTarget found in {step_counter} steps!")
+                print("------------------------------------------------")
                 if use_gui:
                     pygame.quit()
-                
-                # Ritorna le metriche del team!
                 return step_counter, None, centralized_metrics
-
+            
+            # Safety check to prevent infinite loops
+            if step_counter >= 180:
+                if use_gui:
+                    pygame.quit()
+                return 180, None, centralized_metrics
+            
         if use_gui:
             ui_stats = {
                 'step': step_counter,
@@ -940,7 +862,7 @@ def run_simulation(params):
                     'best': current_action
                 }
 
-            render_frame(graphics_ctx, global_belief_map, drones, target_pos, traces, ui_stats)
+            render_frame(graphics_ctx, global_belief_map, drones, target_pos, traces, ui_stats, global_mode)
             graphics_ctx['clock'].tick(60)
 
             for event in pygame.event.get():

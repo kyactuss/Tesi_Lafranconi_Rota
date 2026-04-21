@@ -1,8 +1,11 @@
 import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1"
 import datetime
 import copy
 import pandas as pd
 import numpy as np
+import sys        
+import pygame
 
 
 # Import configuration modules
@@ -52,9 +55,7 @@ def main():
     os.makedirs(session_folder, exist_ok=True)
     print(f"\n Session folder created: {session_folder}")
 
-    # =========================================================================
-    # 1 - PARAMETER CONFIGURATION FOR ALL SCENARIOS 
-    # =========================================================================
+    # 1. MANUAL OR AUTOMATIC SCENARIO CONFIGURATION
     all_scenarios_params = []
     
     for i in range(1, num_scenarios + 1):
@@ -69,79 +70,101 @@ def main():
             params['use_gui'] = False
         all_scenarios_params.append(params)
         
-    print("\n" + "="*50)
-    print(" STARTING SIMULATIONS FOR ALL SCENARIOS ")
-    print("="*50)
-
-    # =========================================================================
-    # 2 - ITERATIONS OVER ALPHA VALUES, SCENARIOS AND ALGORITHMS
-    # =========================================================================
     
-    # Loop over different reward_alpha values
-    for current_alpha in alpha_values:
-        print(f"\n\n{'#'*60}")
-        print(f" STARTING SIMULATIONS WITH REWARD_ALPHA = {current_alpha} ")
-        print(f"{'#'*60}")
+    # 2. ITERATIONS OVER ALPHA VALUES, SCENARIOS AND ALGORITHMS
+    try:
 
-        results_data = []
+        for alpha_idx, current_alpha in enumerate(alpha_values):
+            print(f"\n\n{'#'*60}")
+            print(f" STARTING SIMULATIONS WITH REWARD_ALPHA = {current_alpha} ")
+            print(f"{'#'*60}")
 
-        # Loop for extracting parameters for each scenario
-        for params in all_scenarios_params:
-            scenario_idx = params['scenario_idx']
+            results_data = []
+
+            for sc_idx, params in enumerate(all_scenarios_params):
+                scenario_idx = params['scenario_idx']
             
-            scenario_record = {
-                "Scenario": scenario_idx,
-                "Drone Pos": str(params.get('drone_positions', [])),
-                "Target Pos": str(params.get('target_pos', '')),
-                "Num Peaks": len(params.get('peaks', [])),
-                "Peak Means": str([p['mean'] for p in params.get('peaks', [])]),
-                "Peak Vars": str([p['cov'] for p in params.get('peaks', [])]),
-                "Obstacles": str(params.get('obstacles', [])),
-                "Step POMCP": None,
-                "Step SHR-POMCP": None,
-                "Step CEN-POMCP": None,
-                "Step AUCTION": None,
-                "Step GREEDY": None,
-                "pomcp_metrics": [],
-                "shr_pomcp_metrics": [],
-                "cen_pomcp_metrics": []
-            }
+                remaining_scenarios_current_alpha = len(all_scenarios_params) - sc_idx
+                remaining_scenarios_future_alphas = (len(alpha_values) - alpha_idx - 1) * len(all_scenarios_params)
+                total_remaining_scenarios = remaining_scenarios_current_alpha + remaining_scenarios_future_alphas
+            
+                max_t = params.get('max_time', DEFAULT_CONFIG.get('max_time', 2.5))
+                num_algorithms = len(ALGORITHMS)
+                avg_iterations = 45
+            
+                remaining_seconds = total_remaining_scenarios * num_algorithms * avg_iterations * max_t
+                estimated_time = str(datetime.timedelta(seconds=int(remaining_seconds)))
+            
+                print(f" Estimated remaining time: ~ {estimated_time} ")
+                
+                
+                scenario_record = {
+                    "Scenario": scenario_idx,
+                    "Drone Pos": str(params.get('drone_positions', [])),
+                    "Target Pos": str(params.get('target_pos', '')),
+                    "Num Peaks": len(params.get('peaks', [])),
+                    "Peak Means": str([p['mean'] for p in params.get('peaks', [])]),
+                    "Peak Vars": str([p['cov'] for p in params.get('peaks', [])]),
+                    "Obstacles": str(params.get('obstacles', [])),
+                    "Step POMCP": None,
+                    "Step SHR-POMCP": None,
+                    "Step CEN-POMCP": None,
+                    "Step AUCTION": None,
+                    "Step GREEDY": None,
+                    "pomcp_metrics": [],
+                    "shr_pomcp_metrics": [],
+                    "cen_pomcp_metrics": []
+                }
 
-            for algo_name, algo_module in ALGORITHMS:
-                print(f"\n Executing: {algo_name} (Scenario {scenario_idx} | Alpha {current_alpha})")
-                
-                current_params = copy.deepcopy(params)
-                current_params['algo_name'] = algo_name
-                current_params['save_folder'] = session_folder
-                current_params['reward_alpha'] = current_alpha      # Set current alpha in parameters
-                
-                # Simulation execution: returns steps taken and metrics
-                res = algo_module.run_simulation(current_params)
-                steps_taken = res[0]
-                
-                # Manual interruptions 
-                if steps_taken == -1:
-                    print(f"Simulation {algo_name} stopped by user.")
-                    steps_taken = float('inf') 
-                
-                if algo_name == "DEC-POMCP":
-                    scenario_record["Step POMCP"] = steps_taken
-                    scenario_record["pomcp_metrics"] = res[2] if len(res) > 2 else []
-                elif algo_name == "SHR-POMCP":
-                    scenario_record["Step SHR-POMCP"] = steps_taken
-                    scenario_record["shr_pomcp_metrics"] = res[2] if len(res) > 2 else []
-                elif algo_name == "CEN-POMCP":                            
-                    scenario_record["Step CEN-POMCP"] = steps_taken       
-                    scenario_record["cen_pomcp_metrics"] = res[2] if len(res) > 2 else []    
-                elif algo_name == "AUCTION":
-                    scenario_record["Step AUCTION"] = steps_taken
-                elif algo_name == "GREEDY":
-                    scenario_record["Step GREEDY"] = steps_taken
+                for algo_name, algo_module in ALGORITHMS:
+                    print(f"\n Executing: {algo_name} (Scenario {scenario_idx} | Alpha {current_alpha})")
+                    
+                    current_params = copy.deepcopy(params)
+                    current_params['algo_name'] = algo_name
+                    current_params['save_folder'] = session_folder
+                    current_params['reward_alpha'] = current_alpha
+                    
+                    res = algo_module.run_simulation(current_params)
+                    steps_taken = res[0]
+                    
+                    if steps_taken == -1:
+                        print(f"Simulation {algo_name} stopped by user.")
+                        steps_taken = float('inf') 
+                    
+                    if algo_name == "DEC-POMCP":
+                        scenario_record["Step POMCP"] = steps_taken
+                        scenario_record["pomcp_metrics"] = res[2] if len(res) > 2 else []
+                    elif algo_name == "SHR-POMCP":
+                        scenario_record["Step SHR-POMCP"] = steps_taken
+                        scenario_record["shr_pomcp_metrics"] = res[2] if len(res) > 2 else []
+                    elif algo_name == "CEN-POMCP":
+                        scenario_record["Step CEN-POMCP"] = steps_taken
+                        scenario_record["cen_pomcp_metrics"] = res[2] if len(res) > 2 else []
+                    elif algo_name == "AUCTION":
+                        scenario_record["Step AUCTION"] = steps_taken
+                    elif algo_name == "GREEDY":
+                        scenario_record["Step GREEDY"] = steps_taken
 
-            results_data.append(scenario_record)
+                results_data.append(scenario_record)
 
-        # Call to the function to generate Excel report
-        generate_excel_report(results_data, session_folder, global_timestamp, current_alpha)
+            # Generate complete excel report
+            generate_excel_report(results_data, session_folder, global_timestamp, current_alpha)
+
+    except KeyboardInterrupt:
+        
+        pygame.quit() 
+        print(" Interruption of simulations by user. ")
+        
+        # Save partial data on excel 
+        if 'results_data' in locals() and results_data:
+            print("Partial report generation...")
+            try:
+                alpha_str = current_alpha if 'current_alpha' in locals() else "Sconosciuto"
+                generate_excel_report(results_data, session_folder, global_timestamp, f"{alpha_str}_INTERROTTO")
+            except Exception as e:
+                print(f"Impossible to save partial report: {e}")
+        
+        sys.exit(0)
 
 
 def generate_excel_report(data, session_folder, timestamp, alpha_reward):
@@ -154,7 +177,7 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     writer = pd.ExcelWriter(filename, engine='xlsxwriter')
     workbook = writer.book
 
-    # --- FOGLIO 1: PARAMETRI SCENARI ---
+    # SHEET 1: SCENARIO PARAMETERS
     df_params = pd.DataFrame(data)[["Scenario", "Drone Pos", "Target Pos", "Num Peaks", "Peak Means", "Peak Vars", "Obstacles"]]
     df_params["Num Steps Map"] = DEFAULT_CONFIG['map_size'] 
     df_params.to_excel(writer, sheet_name='Parametri', index=False)
@@ -164,7 +187,7 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
         column_len = max(df_params[col].astype(str).map(len).max(), len(col)) + 2
         worksheet_param.set_column(i, i, column_len)
 
-    # --- FOGLIO 2: PERFORMANCE E VINCITORI ---
+    # SHEET 2: ALGORITHM PERFORMANCE COMPARISON
     performance_records = []
     win_counts = {"DEC-POMCP": 0, "SHR-POMCP": 0, "CEN-POMCP": 0, "AUCTION": 0, "GREEDY": 0}
     
@@ -186,16 +209,16 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
                 win_counts[w] += 1
             winner_str = ", ".join(winners)
         else:
-            winner_str = "Nessuno (Interrotto)"
+            winner_str = "No winner (all interrupted or failed)"
 
         rec = {"Scenario": row["Scenario"]}
-        rec.update({k: (v if v != float('inf') else "Interrotto") for k,v in steps_dict.items()})
-        rec["Vincitori"] = winner_str
+        rec.update({k: (v if v != float('inf') else "Interruption") for k,v in steps_dict.items()})
+        rec["Winners"] = winner_str
         performance_records.append(rec)
 
-    total_row = {"Scenario": "TOTALE VITTORIE"}
+    total_row = {"Scenario": "Total Wins"}
     total_row.update(win_counts)
-    total_row["Vincitori"] = ""
+    total_row["Winners"] = ""
     performance_records.append(total_row)
 
     df_perf = pd.DataFrame(performance_records)
@@ -204,17 +227,17 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     for i, col in enumerate(df_perf.columns):
         worksheet_perf.set_column(i, i, max(len(col)+2, 15))
 
-    # --- FOGLIO 3: POMCP METRICS FOR ALL VERSIONS ---
+    # SHEET 3: POMCP METRICS FOR ALL VERSIONS
     metrics_records = []
     for row in data:
         scenario_num = row["Scenario"]
         
-        # Iteriamo sui tre algoritmi per estrarre le metriche (3 righe per scenario)
+        # Metrics extraction from algorithms 
         for algo_label, metric_key in [("DEC-POMCP", "pomcp_metrics"), ("SHR-POMCP", "shr_pomcp_metrics"), ("CEN-POMCP", "cen_pomcp_metrics")]:
             all_metrics = row[metric_key]
             
             m_list = []
-            # Adattiamo l'estrazione: DEC e SHR sono dizionari (estraiamo Drone 1), CEN è una lista diretta
+            
             if all_metrics:
                 if algo_label in ["DEC-POMCP", "SHR-POMCP"] and 1 in all_metrics:
                     m_list = [m for m in all_metrics[1] if m is not None]
@@ -247,10 +270,7 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     for i, col in enumerate(df_metrics.columns):
         worksheet_met.set_column(i, i, max(len(col)+2, 12))
 
-    # =========================================================================
-    # HELPER FUNCTIONS PER GRAFICI MULTIPLI (DECENTRALIZZATI vs CENTRALIZZATI)
-    # =========================================================================
-
+    # Helper functions for charts 
     def create_spaced_chart_sheet_decentralized(sheet_name, data, metric_key, chart_title, y_axis_name, data_source_key):
         ws = workbook.add_worksheet(sheet_name)
         row_offset = 0
@@ -299,7 +319,7 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
         
         for row in data:
             scenario = row["Scenario"]
-            metrics_list = row[data_source_key] # Nel centr è una lista semplice, non un dizionario
+            metrics_list = row[data_source_key] 
             if not metrics_list: continue
                 
             max_steps = len(metrics_list)
@@ -334,15 +354,15 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
             ws.insert_chart(current_row + 1, 1, chart)
             row_offset = current_row + 22
 
-    # --- SHEET 4 & 5: DEC-POMCP ---
+    # SHEET 4 & 5: DEC-POMCP (EXPLORATION RATIO AND ROOT FLIPS)
     create_spaced_chart_sheet_decentralized('Expl_Ratio', data, 'expl_ratio', 'Exploration vs Exploitation (DEC-POMCP)', 'Ratio %', 'pomcp_metrics')
     create_spaced_chart_sheet_decentralized('Root_Flips', data, 'flips', 'Variazioni Azione Root (DEC-POMCP)', 'Numero Flips', 'pomcp_metrics')
 
-    # --- SHEET 6 & 7: SHR-POMCP ---
+    # SHEET 6 & 7: SHR-POMCP (EXPLORATION RATIO AND ROOT FLIPS)
     create_spaced_chart_sheet_decentralized('Expl_Ratio_SHR', data, 'expl_ratio', 'Exploration vs Exploitation (SHR-POMCP)', 'Ratio %', 'shr_pomcp_metrics')
     create_spaced_chart_sheet_decentralized('Root_Flips_SHR', data, 'flips', 'Variazioni Azione Root (SHR-POMCP)', 'Numero Flips', 'shr_pomcp_metrics')
 
-    # --- SHEET 8 & 9: CEN-POMCP (Utilizzano la funzione per riga singola) ---
+    # SHEET 8 & 9: CEN-POMCP (EXPLORATION RATIO AND ROOT FLIPS)
     create_spaced_chart_sheet_centralized('Expl_Ratio_CEN', data, 'expl_ratio', 'Exploration vs Exploitation (CEN-POMCP)', 'Ratio %', 'cen_pomcp_metrics')
     create_spaced_chart_sheet_centralized('Root_Flips_CEN', data, 'flips', 'Variazioni Azione Root (CEN-POMCP)', 'Numero Flips', 'cen_pomcp_metrics')
 

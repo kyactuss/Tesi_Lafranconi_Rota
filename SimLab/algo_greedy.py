@@ -199,84 +199,8 @@ class GREEDYSolver:
                 claimed_next_positions.add(next_pos)
         return my_final_action
 
-class TSPSolver:
-    def __init__(self, map_size, obstacle_map, drone_id, start_pos, darp_matrix):
-        self.map_size = map_size
-        self.obstacle_map = obstacle_map
-        self.drone_id = drone_id
-        self.start_pos = start_pos
-        self.darp_matrix = darp_matrix
-    
-    def generate_full_plan(self):
-        local_obstacle_map = np.copy(self.obstacle_map)
-        free_cells = []
-        for r in range(self.map_size):
-            for c in range(self.map_size):
-                if self.darp_matrix[r, c] == self.drone_id - 1 and self.obstacle_map[r, c] == 0:
-                    free_cells.append((r, c))
-                else:
-                    local_obstacle_map[r, c] = 1
-                    
-        if self.start_pos not in free_cells:
-            free_cells.insert(0, self.start_pos)
-            local_obstacle_map[self.start_pos[0], self.start_pos[1]] = 0
-            
-        num_free_cells = len(free_cells)
-        if num_free_cells <= 1:
-            return []
-            
-        bfs_distances = precompute_BFS_distances(self.map_size, local_obstacle_map)
-        elk_matrix = [[0] * num_free_cells for _ in range(num_free_cells)]
-        for i in range(num_free_cells):
-            for j in range(num_free_cells):
-                pos_i = free_cells[i]
-                pos_j = free_cells[j]
-                if i == j:
-                    elk_matrix[i][j] = 0
-                else:
-                    elk_matrix[i][j] = int(bfs_distances.get((pos_i, pos_j), 999999))
-            
-        try:
-            tour_indices = elkai.solve_int_matrix(elk_matrix)
-        except Exception as e:
-            print(f"  [D{self.drone_id}] Error in elkai solver: {e}")
-            return []
-            
-        start_idx = free_cells.index(self.start_pos)
-        if start_idx in tour_indices:
-            idx_in_tour = tour_indices.index(start_idx)
-            ordered_tour = tour_indices[idx_in_tour:] + tour_indices[:idx_in_tour]
-        else:
-            ordered_tour = tour_indices
-            
-        ordered_tour.append(ordered_tour[0])
-        actions = []
-        current_pos = free_cells[ordered_tour[0]]
-        
-        for next_node_idx in ordered_tour[1:]:
-            next_pos = free_cells[next_node_idx]
-            while current_pos != next_pos:
-                best_action = None
-                best_next = None
-                min_d = float('inf')
-                for action, delta in MOVES_DELTA.items():
-                    if action == 'Stay':
-                        continue
-                    nr, nc = current_pos[0] + delta[0], current_pos[1] + delta[1]
-                    if 0 <= nr < self.map_size and 0 <= nc < self.map_size and local_obstacle_map[nr, nc] == 0:
-                        d = bfs_distances.get((next_pos, (nr, nc)), float('inf'))
-                        if d < min_d:
-                            min_d = d
-                            best_action = action
-                            best_next = (nr, nc)
-                if best_action is None:
-                    break
-                actions.append(best_action)
-                current_pos = best_next
-        return actions
-
 # =============================================================================
-# 4. DRONE AGENT 
+# DRONE AGENT 
 # =============================================================================
 
 class DroneAgent:
@@ -299,16 +223,7 @@ class DroneAgent:
         self.discovered_traces = set()
         
         if self.search_mode == 'TSP':
-            self.tsp_plan = deque()
-            self.tsp_solver = TSPSolver(
-                map_size=params['map_size'],
-                obstacle_map=self.obstacle_map,
-                drone_id=self.id,
-                start_pos=self.pos,
-                darp_matrix=params.get('darp_assignment')
-            )   
-            full_plan = self.tsp_solver.generate_full_plan()
-            self.tsp_plan.extend(full_plan)
+            self.tsp_plan = deque(self.params.get('tsp_plans', {}).get(self.id, []))
 
     def execute_move(self):
         d = MOVES_DELTA.get(self.final_action, (0, 0))
@@ -422,17 +337,15 @@ class DroneAgent:
                 if pos not in self.discovered_traces:
                     self.belief_map = self.apply_trace_distribution(obs)
                     self.discovered_traces.add(pos)
-                    print(f"  [D{self.id}] New trace discovered at {pos} of type '{obs['type']}'")
                     if self.search_mode == 'TSP':
                         self.search_mode = 'GREEDY'
-                        print(f"  [D{self.id}] Switching from TSP to GREEDY mode due to trace detection")
             elif isinstance(obs, int) and obs in [0, 1]:
                 self.belief_map = self.get_updated_belief_map(self.belief_map, pos, obs)
                 self.explored_cells.add(pos)
         self.partner_observations.clear()
 
 # =============================================================================
-# 4. GRAPHIC FUNCTIONS 
+# GRAPHIC FUNCTIONS 
 # =============================================================================
 
 def draw_static_background(graphics_ctx, belief_map, drones=None):
@@ -700,19 +613,17 @@ def run_simulation(params):
         drones.append(drone)
 
     running = True
-    auto_mode = True           # Avvio automatico forzato
+    auto_mode = True           
     step_counter = 0
-    move_interval_sec = 0.0    # Simulazione rapida
+    move_interval_sec = 0.0    
     last_step_time = 0.0
     
     while running:
-            
-            # --- INIZIO MODIFICA 1: Ignora il timer se use_gui è False ---
+             
             if not use_gui or (auto_mode and (time.monotonic() - last_step_time) >= move_interval_sec):
                 
                 if use_gui:
                     last_step_time = time.monotonic()
-            # --- FINE MODIFICA 1 ---
                 
                 step_counter += 1
 
@@ -725,7 +636,6 @@ def run_simulation(params):
                     for drone in drones:
                         if getattr(drone, 'search_mode', None) == 'TSP':
                             drone.search_mode = 'GREEDY'
-                            print(f"  [D{drone.id}] Switching from TSP to GREEDY mode because all TSP plans are empty")
 
                 for drone in drones:
                     if drone.search_mode == 'TSP':
@@ -766,17 +676,19 @@ def run_simulation(params):
                 for drone in drones:
                     drone.update_belief_from_all_obs()
 
-                # --- INIZIO MODIFICA 2: Il render_frame è stato rimosso da qui e spostato sotto ---
-
                 if drones[0].belief_map.max() >= 0.95:
-                    print(f"\n TARGET TROVATO in {step_counter} step! (probabilità > 95%)")
-                    # --- INIZIO MODIFICA 3: Chiudi pygame solo se è aperto ---
+                    print(f"\n Target found in {step_counter} steps!")
+                    print("------------------------------------------------")
                     if use_gui:
                         pygame.quit()
-                    # --- FINE MODIFICA 3 ---
                     return step_counter, None
-        
-            # --- INIZIO MODIFICA 4: Rendering e gestione eventi spostati qui e subordinati a use_gui ---
+                
+                # Safety check to prevent infinite loops in case of issues
+                if step_counter >= 350:
+                    if use_gui:
+                        pygame.quit()
+                    return 350, None
+                
             if use_gui:
                 render_frame(graphics_ctx, drones, target_pos, traces, step_counter)
                 graphics_ctx['clock'].tick(60)
@@ -791,7 +703,5 @@ def run_simulation(params):
                             return -1, []
                         if event.key == pygame.K_SPACE: 
                             auto_mode = not auto_mode
-                            # Sincronizzazione del timer quando si riprende dalla pausa
                             if auto_mode:
                                 last_step_time = time.monotonic() - move_interval_sec
-            # --- FINE MODIFICA 4 ---

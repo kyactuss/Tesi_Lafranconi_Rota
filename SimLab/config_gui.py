@@ -4,21 +4,23 @@ import numpy as np
 from collections import deque
 from scipy.ndimage import label, distance_transform_edt
 import random
+import elkai
 import random
 
 # =============================================================================
 # 1. PARAMETERS CONFIGURATION AND GLOBAL CONSTANTS
 # =============================================================================
+
 DEFAULT_CONFIG = {
     'map_size': 20,
     'alpha_sensor': 0.01,
     'beta_sensor': 0.01,
-    'max_time': 2,
+    'max_time': 3,
     'depth_limit': 1000,
     'discount_factor': 0.95,
     'exploration_const': math.sqrt(2),
-    'reward_alpha': 3,                  #DEFAULT: 1
-    'explorative_reward': 0.0025,       #DEFAULT: 0.0025
+    'reward_alpha': 3,                  
+    'explorative_reward': 0.0025,       
     'r_target': 1,
 }
 
@@ -76,6 +78,8 @@ DARP_AREA_COLORS = [
 # =============================================================================
 # 2. SUPPORT FUNCTIONS
 # =============================================================================
+
+# Function to initialize obstacle map 
 def initialize_obstacle_map(params):
     map_size = params['map_size']
     obstacle_map = np.zeros((map_size, map_size), dtype=int)
@@ -84,6 +88,7 @@ def initialize_obstacle_map(params):
         obstacle_map[r, c] = 1
     return obstacle_map
 
+#Function to precompute BFS distances for rollout phase and DARP partinioning
 def precompute_BFS_distances(map_size, obstacle_map):
     dist_BFS = {}
     directions = [delta for action, delta in MOVES_DELTA.items() if action != 'Stay']
@@ -116,6 +121,108 @@ def precompute_BFS_distances(map_size, obstacle_map):
                     queue.append((next_pos, dist + 1))
     return dist_BFS
 
+class TSPSolver:
+    def __init__(self, map_size, obstacle_map, drone_id, start_pos, darp_matrix):
+        self.map_size = map_size
+        self.obstacle_map = obstacle_map
+        self.drone_id = drone_id
+        self.start_pos = start_pos
+        self.darp_matrix = darp_matrix
+    
+    def generate_full_plan(self, bfs_distances_full=None):
+        local_obstacle_map = np.copy(self.obstacle_map)
+        free_cells = []
+        
+        for r in range(self.map_size):
+            for c in range(self.map_size):
+                if self.darp_matrix[r, c] == self.drone_id - 1 and self.obstacle_map[r, c] == 0:
+                    free_cells.append((r, c))
+                else:
+                    local_obstacle_map[r, c] = 1
+                    
+        if self.start_pos not in free_cells:
+            free_cells.insert(0, self.start_pos)
+            local_obstacle_map[self.start_pos[0], self.start_pos[1]] = 0
+            
+        num_free_cells = len(free_cells)
+
+        if num_free_cells <= 1:
+            return []
+            
+        bfs_distances = precompute_BFS_distances(self.map_size, local_obstacle_map)
+                
+        elk_matrix = [[0] * num_free_cells for _ in range(num_free_cells)]
+        for i in range(num_free_cells):
+            for j in range(num_free_cells):
+                pos_i = free_cells[i]
+                pos_j = free_cells[j]
+                if i == j:
+                    elk_matrix[i][j] = 0
+                else:
+                    elk_matrix[i][j] = int(bfs_distances.get((pos_i, pos_j), 999999))
+        
+        try:
+            tour_indices = elkai.solve_int_matrix(elk_matrix)
+        except Exception as e:
+            print(f"  [D{self.drone_id}] Error in elkai solver: {e}")
+            return []
+            
+        start_idx = free_cells.index(self.start_pos)
+        if start_idx in tour_indices:
+            idx_in_tour = tour_indices.index(start_idx)
+            ordered_tour = tour_indices[idx_in_tour:] + tour_indices[:idx_in_tour]
+        else:
+            ordered_tour = tour_indices
+            
+        ordered_tour.append(ordered_tour[0])
+            
+        actions = []
+        current_pos = free_cells[ordered_tour[0]]
+        
+        for next_node_idx in ordered_tour[1:]:
+            next_pos = free_cells[next_node_idx]
+            
+            while current_pos != next_pos:
+                best_action = None
+                best_next = None
+                min_d = float('inf')
+                
+                for action, delta in MOVES_DELTA.items():
+                    if action == 'Stay':
+                        continue
+                    nr, nc = current_pos[0] + delta[0], current_pos[1] + delta[1]
+                    if 0 <= nr < self.map_size and 0 <= nc < self.map_size and local_obstacle_map[nr, nc] == 0:
+                        d = bfs_distances.get((next_pos, (nr, nc)), float('inf'))
+                        if d < min_d:
+                            min_d = d
+                            best_action = action
+                            best_next = (nr, nc)
+                            
+                if best_action is None:
+                    break  
+                    
+                actions.append(best_action)
+                current_pos = best_next
+                
+        return actions
+
+def generate_all_tsp_plans(params):
+    tsp_plans = {}
+    obstacle_map = initialize_obstacle_map(params)
+    for i in range(params['num_drones']):
+        drone_id = i + 1
+        tsp = TSPSolver(
+            map_size=params['map_size'],
+            obstacle_map=obstacle_map,
+            drone_id=drone_id,
+            start_pos=params['drone_positions'][i],
+            darp_matrix=params['darp_assignment']
+        )
+        plan = tsp.generate_full_plan()
+        tsp_plans[drone_id] = plan
+    return tsp_plans
+
+# Function to partition the map when uniform belief map is selected
 def darp_partitioning(params, max_iter=80000, variate_weight=0.01, random_level=0.0001, limit_cells_diff=2, use_importance=True):
     map_size = params['map_size']
     num_drones = params['num_drones']
@@ -265,6 +372,7 @@ def darp_partitioning(params, max_iter=80000, variate_weight=0.01, random_level=
 # =============================================================================
 # 3. FUNCTION FOR USER CONFIGURATION 
 # =============================================================================
+
 def get_user_parameters(scenario_idx=1):
     
     print(f"\n=== SEARCH MISSION CONFIGURATION (SCENARIO {scenario_idx}) ===")
@@ -501,7 +609,7 @@ def get_user_parameters(scenario_idx=1):
         print("\n[4/6] No Gaussian peak needed (uniform map)")
     
     # PHASE 5: Traces position selection
-    print("\n[5/6] Select TRACES positions (multiple clicks + ENTER, or just ENTER for none)")
+    print("\n[5/6] Select TRACES positions (multiple clicks + ENTER or just ENTER for none)")
     selected_traces_coords = interactive_selection("5. TRACES Positions", COLORS['ORANGE'], allow_multiple=True, context_items=dictionary_context, validate_cell=True, allow_empty=True)
     
     dictionary_context['traces'] = []
@@ -524,8 +632,8 @@ def get_user_parameters(scenario_idx=1):
         if trace_type_input == '1':
             while True:
                 try:
-                    mu_deg = float(input("  Enter direction μ (in degrees): "))
-                    kappa = float(input("  Enter concentration κ: "))
+                    mu_deg = float(input("  Enter direction μ in degrees (0° right, 90° down, 180° left, 270° up): "))
+                    kappa = float(input("  Enter concentration κ (higher values = more concentrated): "))
                     if kappa >= 0:
                         break
                     print("  Concentration must be non-negative.")
@@ -542,7 +650,7 @@ def get_user_parameters(scenario_idx=1):
         elif trace_type_input == '2':
             while True:
                 try:
-                    radius = float(input("  Enter radius: "))
+                    radius = float(input("  Enter radius (higher values = larger ring): "))
                     variance = float(input("  Enter variance: "))
                     if radius > 0 and variance > 0:
                         break
@@ -608,7 +716,7 @@ def get_user_parameters(scenario_idx=1):
         'peaks': dictionary_context['peaks'],
         'traces': dictionary_context['traces'],
         'obstacles': dictionary_context['obstacles'],
-        'scenario_idx': scenario_idx  # Salviamo l'indice dello scenario nei parametri per usarlo nello screenshot
+        'scenario_idx': scenario_idx  
     }
     
     obstacle_map = initialize_obstacle_map(params_dict)
@@ -620,21 +728,25 @@ def get_user_parameters(scenario_idx=1):
         assignment_matrix = darp_partitioning(params_dict)
         params_dict['darp_assignment'] = assignment_matrix
         print("[DARP] Division completed successfully.")
+        print("[TSP] Generating TSP plans for all drones...")
+        params_dict['tsp_plans'] = generate_all_tsp_plans(params_dict)
+        print("[TSP] TSP plans generated.")
+    else:
+        params_dict['tsp_plans'] = {}
 
     return params_dict
-
-
 
 
 # =============================================================================
 # 4. FUNCTION FOR AUTOMATIC CONFIGURATION
 # =============================================================================
+
 def generate_random_parameters(scenario_idx, map_size=None):
     if map_size is None:
         map_size = DEFAULT_CONFIG['map_size']
     print(f"\nGeneration of Scenario {scenario_idx} in progress...")
     
-    # 1. Drones: Fixed to 4 for now
+    # 1. Drones: Fixed to 4 
     num_drones = 4
     
     params = {
@@ -660,14 +772,13 @@ def generate_random_parameters(scenario_idx, map_size=None):
         (map_size - 1, map_size - 1)
     ]
     
-    # =========================================================================
-    # GENERATE VALID MAP (With BFS connectivity test)
-    # =========================================================================
+    # Generation of valid map, using BFS test
     while True:
-        # A. Drone Placement (Exactly 1 drone per corner)
+
+        # A. Drone Placement (1 drone per corner)
         params['drone_positions'] = corners.copy()
         
-        # B. Target Placement (at least distance 3 from all drones)
+        # B. Target Placement 
         while True:
             tr = random.randint(0, map_size - 1)
             tc = random.randint(0, map_size - 1)
@@ -676,15 +787,16 @@ def generate_random_parameters(scenario_idx, map_size=None):
             # Chebyshev distance
             min_dist = min(max(abs(tr - dr), abs(tc - dc)) for dr, dc in params['drone_positions'])
             
-            if min_dist >= 5 and target_pos not in params['drone_positions']:
+            # Target must be at least distance 6 from all drones
+            if min_dist >= 6 and target_pos not in params['drone_positions']:
                 params['target_pos'] = target_pos
                 break
                 
         protected_cells = set(params['drone_positions'] + [params['target_pos']])
         
-        # C. Maze-like Obstacle Generation (10% - 35%)
+        # C. Obstacle Generation (25% - 40%)
         total_cells = map_size * map_size
-        target_obs_count = random.randint(int(total_cells * 0.10), int(total_cells * 0.35))
+        target_obs_count = random.randint(int(total_cells * 0.25), int(total_cells * 0.40))
         obstacles = set()
         
         while len(obstacles) < target_obs_count:
@@ -714,7 +826,7 @@ def generate_random_parameters(scenario_idx, map_size=None):
                             obstacles.add((curr_r, curr_c))
                             
             else:
-                # 40% chance: L-shape or U-shape (creates dead ends / cul-de-sacs)
+                # 40% chance: L-shape or U-shape 
                 length1 = random.randint(3, 6)
                 length2 = random.randint(3, 6)
                 dr1, dc1 = random.choice([(0,1), (1,0), (0,-1), (-1,0)])
@@ -756,19 +868,14 @@ def generate_random_parameters(scenario_idx, map_size=None):
                         visited.add((nr, nc))
                         queue.append((nr, nc))
         
-        # If BFS reached all free cells, the map is perfectly playable
         if len(visited) == free_cells_count:
             params['dist_BFS'] = precompute_BFS_distances(map_size, obs_map)
             break 
         else:
-            # Map is broken (contains inaccessible rooms). Discard and retry.
+            # Map is discarded and retry.
             pass
 
-    # =========================================================================
-    # MAP TYPE, PEAKS, AND TRACES
-    # =========================================================================
-    
-    # Always Multi-Gaussian (2)
+    # E. Map Type and Peaks/Traces Generation
     params['map_type'] = 2
     
     all_coords = [(r, c) for r in range(map_size) for c in range(map_size)]
@@ -804,11 +911,12 @@ def generate_random_parameters(scenario_idx, map_size=None):
         })
 
     # --- TRACES ---
-    # Traces completely removed as requested
     params['traces'] = []
+    
+    params['tsp_plans'] = {}
 
     print(f"✓ Scenario {scenario_idx} ready!")
-    print(f"  - Drones: {num_drones} (4 corners)")
+    print(f"  - Drones: {num_drones}")
     print(f"  - Map Type: Multi-Gaussian")
     print(f"  - Obstacles: {len(params['obstacles'])} cells (Maze-like)")
     print(f"  - Peaks: {len(params['peaks'])} (1 close, {len(peak_centers)-1} traps)")

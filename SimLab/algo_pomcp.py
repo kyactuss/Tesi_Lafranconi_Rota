@@ -8,6 +8,8 @@ import numpy as np
 from scipy.stats import multivariate_normal
 import pygame
 import multiprocessing
+import signal
+import os
 
 #Global constants
 MOVES_DELTA = {
@@ -131,7 +133,7 @@ def precompute_BFS_distances(map_size, obstacle_map):
     return dist_BFS
 
 # =============================================================================
-# 2. DEC-POMCP LOGIC 
+# DEC-POMCP LOGIC 
 # =============================================================================
 
 class POMCPNode:
@@ -170,7 +172,6 @@ class POMCPSolver:
         self.total_nodes_created = 1 
         self.max_depth_reached = 0
 
-        # VARIABILI NUOVE PER TRACCIAMENTO
         self.root_action_flips = 0
         self.last_root_action = None
         iterations = 0
@@ -191,7 +192,6 @@ class POMCPSolver:
         best_action = self._select_best_action(root)
         future_plans = self._extract_future_plans(root)
         
-        # --- CALCOLO METRICHE PER EXCEL ---
         exploitation = root.q_value_actions.get(best_action, 0.0)
         n_a = root.action_counts.get(best_action, 0)
         N = root.total_node_visits
@@ -237,7 +237,6 @@ class POMCPSolver:
 
         action = self._ucb_search(node)
         
-        # TRACCIAMENTO FLIP AZIONE AL ROOT
         if node == self.root:
             if self.last_root_action is not None and action != self.last_root_action:
                 self.root_action_flips += 1
@@ -515,87 +514,8 @@ def worker_pomcp_task(params, belief_map, my_pos, partner_positions, partner_pla
         'metrics': metrics
     }
 
-class TSPSolver:
-    def __init__(self, map_size, obstacle_map, drone_id, start_pos, darp_matrix):
-        self.map_size = map_size
-        self.obstacle_map = obstacle_map
-        self.drone_id = drone_id
-        self.start_pos = start_pos
-        self.darp_matrix = darp_matrix
-    
-    def generate_full_plan(self):
-        local_obstacle_map = np.copy(self.obstacle_map)     
-        free_cells = []
-        for r in range(self.map_size):
-            for c in range(self.map_size):
-                if self.darp_matrix[r, c] == self.drone_id - 1 and self.obstacle_map[r, c] == 0:
-                    free_cells.append((r, c))
-                else:
-                    local_obstacle_map[r, c] = 1
-                    
-        if self.start_pos not in free_cells:
-            free_cells.insert(0, self.start_pos)
-            local_obstacle_map[self.start_pos[0], self.start_pos[1]] = 0
-            
-        num_free_cells = len(free_cells)
-
-        if num_free_cells <= 1:
-            return []
-            
-        bfs_distances = precompute_BFS_distances(self.map_size, local_obstacle_map)
-                
-        elk_matrix = [[0] * num_free_cells for _ in range(num_free_cells)]
-        for i in range(num_free_cells):
-            for j in range(num_free_cells):
-                pos_i = free_cells[i]
-                pos_j = free_cells[j]
-                if i == j:
-                    elk_matrix[i][j] = 0
-                else:
-                    elk_matrix[i][j] = int(bfs_distances.get((pos_i, pos_j), 999999))
-            
-        try:
-            tour_indices = elkai.solve_int_matrix(elk_matrix)
-        except Exception as e:
-            print(f"  [D{self.drone_id}] Error in elkai solver: {e}")
-            return []
-            
-        start_idx = free_cells.index(self.start_pos)
-        if start_idx in tour_indices:
-            idx_in_tour = tour_indices.index(start_idx)
-            ordered_tour = tour_indices[idx_in_tour:] + tour_indices[:idx_in_tour]
-        else:
-            ordered_tour = tour_indices
-            
-        ordered_tour.append(ordered_tour[0])
-            
-        actions = []
-        current_pos = free_cells[ordered_tour[0]]
-        
-        for next_node_idx in ordered_tour[1:]:
-            next_pos = free_cells[next_node_idx]
-            while current_pos != next_pos:
-                best_action = None
-                best_next = None
-                min_d = float('inf')
-                for action, delta in MOVES_DELTA.items():
-                    if action == 'Stay':
-                        continue
-                    nr, nc = current_pos[0] + delta[0], current_pos[1] + delta[1]
-                    if 0 <= nr < self.map_size and 0 <= nc < self.map_size and local_obstacle_map[nr, nc] == 0:
-                        d = bfs_distances.get((next_pos, (nr, nc)), float('inf'))
-                        if d < min_d:
-                            min_d = d
-                            best_action = action
-                            best_next = (nr, nc)
-                if best_action is None:
-                    break  
-                actions.append(best_action)
-                current_pos = best_next
-        return actions
-
 # =============================================================================
-# 4. DRONE AGENT 
+# DRONE AGENT 
 # =============================================================================
 
 class DroneAgent:
@@ -638,16 +558,7 @@ class DroneAgent:
         self.discovered_traces = set()      
         
         if self.search_mode == 'TSP':
-            self.tsp_plan = deque()         
-            self.tsp_solver = TSPSolver(
-                map_size=params['map_size'],
-                obstacle_map=self.obstacle_map,
-                drone_id=self.id,
-                start_pos=self.pos,
-                darp_matrix=params.get('darp_assignment')
-            )   
-            full_plan = self.tsp_solver.generate_full_plan()        
-            self.tsp_plan.extend(full_plan)
+            self.tsp_plan = deque(self.params.get('tsp_plans', {}).get(self.id, []))         
 
     def send_intention(self):
         return {'id': self.id, 'pos': self.pos, 'best_action': self.planned_result.get('best_action', 'Stay')}
@@ -695,7 +606,7 @@ class DroneAgent:
             self.partner_final_actions[partner_id] = final_actions[partner_id]
         
         if self.final_action != original_action:
-            pass # debug silenziato per velocità
+            pass 
 
     def execute_move(self):
         d = MOVES_DELTA.get(self.final_action, (0, 0))
@@ -791,10 +702,8 @@ class DroneAgent:
                 if pos not in self.discovered_traces:       
                     self.belief_map = self.apply_trace_distribution(obs)
                     self.discovered_traces.add(pos)
-                    print(f"  [D{self.id}] New trace discovered at {pos} of type '{obs['type']}'")
                     if self.search_mode == 'TSP':
                         self.search_mode = 'POMCP'
-                        print(f"  [D{self.id}] Switching from TSP to POMCP mode due to trace detection")
             elif isinstance(obs, int) and obs in [0, 1]:    
                 self.belief_map = self.solver_tool.get_updated_belief_map_with_sensors(self.belief_map, pos, obs, self.solver_tool.sensor_alpha, self.solver_tool.sensor_beta)
                 self.explored_cells.add(pos)
@@ -802,7 +711,7 @@ class DroneAgent:
         self.partner_observations.clear()
 
 # =============================================================================
-# 4. GRAPHIC FUNCTIONS 
+# GRAPHIC FUNCTIONS 
 # =============================================================================
 
 def draw_static_background(graphics_ctx, belief_map, drones=None):
@@ -1065,6 +974,11 @@ def render_frame(graphics_ctx, drones, target_pos, traces, ui_stats):
 # MAIN LOOP
 # =============================================================================
 
+# To stop multiprocessing 
+def mute_sigint():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def run_simulation(params):
 
     use_gui = params.get('use_gui', True) 
@@ -1100,16 +1014,18 @@ def run_simulation(params):
         } for drone in drones}
     }
 
-    pool = multiprocessing.Pool(processes=num_drones)
+    pool = multiprocessing.Pool(processes=num_drones, initializer=mute_sigint)
     
     scenario_idx = params.get('scenario_idx', 1)
     algo_name = params.get('algo_name', 'POMCP')
     
     if use_gui:
         render_frame(graphics_ctx, drones, target_pos, traces, ui_stats)
+        save_folder = params.get('save_folder', '') 
         screenshot_name = f"Scenario_{scenario_idx}_{algo_name}_Frame0.png"
-        pygame.image.save(graphics_ctx['screen'], screenshot_name)
-        print(f"\n✓ Screenshot iniziale salvato come '{screenshot_name}'")
+        screenshot_path = os.path.join(save_folder, screenshot_name) if save_folder else screenshot_name
+        pygame.image.save(graphics_ctx['screen'], screenshot_path)
+        print(f"\n Screenshot saved in: '{screenshot_path}'")
 
     running = True
     auto_mode = True
@@ -1138,7 +1054,6 @@ def run_simulation(params):
                     for drone in drones:
                         if getattr(drone, 'search_mode', None) == 'TSP':
                             drone.search_mode = 'POMCP'
-                            print(f"  [D{drone.id}] Switching from TSP to POMCP mode because all TSP plans are empty")
 
                 tasks = []
                 for drone in drones:
@@ -1222,12 +1137,17 @@ def run_simulation(params):
                     all_drones_metrics[drone.id].append(metric)
 
                 if drones[0].belief_map.max() >= 0.95:
-                    print(f"\n TARGET TROVATO in {step_counter} step! (probabilità > 95%)")
-                    
+                    print(f"\n Target found in {step_counter} step!")
+                    print("------------------------------------------------")
                     if use_gui:
                         pygame.quit()
-                    
                     return step_counter, None, all_drones_metrics
+                
+                # Safety stop to prevent infinite loops in case of issues
+                if step_counter >= 350:
+                    if use_gui:
+                        pygame.quit()
+                    return 350, None, all_drones_metrics
 
             if use_gui:
                 render_frame(graphics_ctx, drones, target_pos, traces, ui_stats)
@@ -1243,11 +1163,10 @@ def run_simulation(params):
                             return -1, [], {}
                         if event.key == pygame.K_SPACE: 
                             auto_mode = not auto_mode
-                            # Sincronizzazione del timer quando si riprende dalla pausa
                             if auto_mode:
                                 last_step_time = time.monotonic() - move_interval_sec
             
             
     finally:
-        pool.close()    
+        pool.terminate()     
         pool.join()
