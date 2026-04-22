@@ -89,10 +89,10 @@ def main():
                 total_remaining_scenarios = remaining_scenarios_current_alpha + remaining_scenarios_future_alphas
             
                 max_t = params.get('max_time', DEFAULT_CONFIG.get('max_time', 2.5))
-                num_algorithms = len(ALGORITHMS)
-                avg_iterations = 45
+                num_pomcp_algorithms = 3
+                avg_iterations = 50
             
-                remaining_seconds = total_remaining_scenarios * num_algorithms * avg_iterations * max_t
+                remaining_seconds = avg_iterations * num_pomcp_algorithms * max_t * total_remaining_scenarios
                 estimated_time = str(datetime.timedelta(seconds=int(remaining_seconds)))
             
                 print(f" Estimated remaining time: ~ {estimated_time} ")
@@ -227,7 +227,102 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     for i, col in enumerate(df_perf.columns):
         worksheet_perf.set_column(i, i, max(len(col)+2, 15))
 
+
+    # Head-to-Head Charts
+
+    # Dictionary to map algorithm names to dictionary keys
+    algo_keys = {
+        "DEC-POMCP": "Step POMCP",
+        "SHR-POMCP": "Step SHR-POMCP",
+        "AUCTION": "Step AUCTION",
+        "GREEDY": "Step GREEDY"
+    }
+
+    # The 5 comparisons
+    comparisons = [
+        ("DEC-POMCP", "GREEDY"),
+        ("DEC-POMCP", "AUCTION"),
+        ("DEC-POMCP", "SHR-POMCP"),
+        ("SHR-POMCP", "AUCTION"),
+        ("SHR-POMCP", "GREEDY")
+    ]
+
+    data_col = 20 # Column U (hidden far right to store the chart data)
+    data_row = 1
+    
+    chart_row_1 = len(performance_records) + 3   # Row 1 of charts
+    chart_row_2 = chart_row_1 + 16               # Row 2 of charts (below row 1)
+
+    # Grid positions for the 5 charts (row, col)
+    # Top row: 3 charts spaced out
+    # Bottom row: 2 charts centered
+    positions = [
+        (chart_row_1, 0),   # Col A
+        (chart_row_1, 5),   # Col F
+        (chart_row_1, 10),  # Col K
+        (chart_row_2, 2),   # Col C (centered)
+        (chart_row_2, 7)    # Col H (centered)
+    ]
+
+    for idx, (algo1, algo2) in enumerate(comparisons):
+        w1, w2, draws = 0, 0, 0
+        
+        # Calculate Head-to-Head for all scenarios
+        for row in data:
+            v1 = row.get(algo_keys[algo1])
+            v2 = row.get(algo_keys[algo2])
+            
+            # Treat None as infinity (failed/interrupted)
+            v1_val = v1 if v1 is not None else float('inf')
+            v2_val = v2 if v2 is not None else float('inf')
+            
+            if v1_val < v2_val:
+                w1 += 1
+            elif v2_val < v1_val:
+                w2 += 1
+            else:
+                if v1_val != float('inf'): # Count draw only if both finished
+                    draws += 1
+
+        # Write data to the hidden table area
+        worksheet_perf.write(data_row, data_col, algo1)
+        worksheet_perf.write(data_row+1, data_col, w1)
+
+        worksheet_perf.write(data_row, data_col+1, algo2)
+        worksheet_perf.write(data_row+1, data_col+1, w2)
+
+        worksheet_perf.write(data_row, data_col+2, "Draws")
+        worksheet_perf.write(data_row+1, data_col+2, draws)
+
+        # Create the column chart
+        chart = workbook.add_chart({'type': 'column'})
+        
+        # Add series and color the bars (Blue for Algo1, Red for Algo2, Grey for Draws)
+        chart.add_series({
+            'categories': ['Performance', data_row, data_col, data_row, data_col+2],
+            'values':     ['Performance', data_row+1, data_col, data_row+1, data_col+2],
+            'data_labels': {'value': True},
+            'points': [
+                {'fill': {'color': '#4F81BD'}}, 
+                {'fill': {'color': '#C0504D'}}, 
+                {'fill': {'color': '#A6A6A6'}}  
+            ]
+        })
+        
+        chart.set_title({'name': f"{algo1} vs {algo2}"})
+        chart.set_y_axis({'name': 'Head-to-Head Wins'})
+        chart.set_legend({'none': True})
+        chart.set_size({'width': 350, 'height': 280}) # Keep it compact to fit side-by-side
+
+        # Insert chart in the designated position
+        ws_row, ws_col = positions[idx]
+        worksheet_perf.insert_chart(ws_row, ws_col, chart)
+
+        data_row += 3 # Move down for the next chart's data
+
+    # =========================================================================
     # SHEET 3: POMCP METRICS FOR ALL VERSIONS
+    # =========================================================================
     metrics_records = []
     for row in data:
         scenario_num = row["Scenario"]
@@ -270,7 +365,9 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     for i, col in enumerate(df_metrics.columns):
         worksheet_met.set_column(i, i, max(len(col)+2, 12))
 
+    # =========================================================================
     # Helper functions for charts 
+    # =========================================================================
     def create_spaced_chart_sheet_decentralized(sheet_name, data, metric_key, chart_title, y_axis_name, data_source_key):
         ws = workbook.add_worksheet(sheet_name)
         row_offset = 0

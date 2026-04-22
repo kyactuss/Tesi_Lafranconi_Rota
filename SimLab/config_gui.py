@@ -11,17 +11,36 @@ import random
 # 1. PARAMETERS CONFIGURATION AND GLOBAL CONSTANTS
 # =============================================================================
 
+''' 
+INSTRUCTIONS FOR CONFIGURATION:
+
+-Map size: Modifiable (suggested between 15 and 30)
+-Alpha and Beta sensor: Modifiable (suggested between 0 (ideal sensor) and 0.1 (very noisy sensor))
+-Max time: Modifiable (suggested between 1 and 5 seconds)
+-Depth limit: Modifiable only if we want to limit the MCTS depth
+-Discount factor: Modifiable (suggested between 0.9 and 0.99)
+-Exploration constant: Modifiable (for our rewards suggested around sqrt(2))
+-Reward alpha: Default value, will be overridden launching the simulator
+-Explorative: Modifiable (suggested between 0.0025 and 0.005)
+-R_target: Modifiable (suggested 1)
+-Number of drones: Modifiable, max 8 drones (suggested between 2 and 4)
+-Obstacle percentage: Modifiable (suggested between 0.20 and 0.40)
+'''
+
+
 DEFAULT_CONFIG = {
-    'map_size': 20,
+    'map_size': 10,
     'alpha_sensor': 0.01,
     'beta_sensor': 0.01,
-    'max_time': 3,
+    'max_time': 1,
     'depth_limit': 1000,
     'discount_factor': 0.95,
     'exploration_const': math.sqrt(2),
-    'reward_alpha': 3,                  
+    'reward_alpha': 3,                              
     'explorative_reward': 0.0025,       
     'r_target': 1,
+    'num_drones': 3,
+    'obstacle_percentage': 0.35,
 }
 
 # Movements related to actions, used for position updates
@@ -746,8 +765,7 @@ def generate_random_parameters(scenario_idx, map_size=None):
         map_size = DEFAULT_CONFIG['map_size']
     print(f"\nGeneration of Scenario {scenario_idx} in progress...")
     
-    # 1. Drones: Fixed to 4 
-    num_drones = 4
+    num_drones = DEFAULT_CONFIG['num_drones']
     
     params = {
         'map_size': map_size,
@@ -764,19 +782,23 @@ def generate_random_parameters(scenario_idx, map_size=None):
         'scenario_idx': scenario_idx
     }
 
-    # Available corners for drone starting positions
-    corners = [
+    # Available corners and midpoints for drone starting positions
+    all_start_positions = [
         (0, 0), 
         (0, map_size - 1), 
         (map_size - 1, 0), 
-        (map_size - 1, map_size - 1)
+        (map_size - 1, map_size - 1),
+        (0, map_size // 2),
+        (map_size - 1, map_size // 2),
+        (map_size // 2, 0),
+        (map_size // 2, map_size - 1)
     ]
     
     # Generation of valid map, using BFS test
     while True:
 
-        # A. Drone Placement (1 drone per corner)
-        params['drone_positions'] = corners.copy()
+        # A. Drone Placement
+        params['drone_positions'] = all_start_positions[:num_drones].copy()
         
         # B. Target Placement 
         while True:
@@ -794,9 +816,10 @@ def generate_random_parameters(scenario_idx, map_size=None):
                 
         protected_cells = set(params['drone_positions'] + [params['target_pos']])
         
-        # C. Obstacle Generation (25% - 40%)
+        # C. Obstacle Generation
         total_cells = map_size * map_size
-        target_obs_count = random.randint(int(total_cells * 0.25), int(total_cells * 0.40))
+        obs_perc = DEFAULT_CONFIG.get('obstacle_percentage', 0.35)
+        target_obs_count = int(total_cells * obs_perc)
         obstacles = set()
         
         while len(obstacles) < target_obs_count:
