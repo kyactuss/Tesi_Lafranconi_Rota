@@ -177,7 +177,42 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
     writer = pd.ExcelWriter(filename, engine='xlsxwriter')
     workbook = writer.book
 
-    # SHEET 1: SCENARIO PARAMETERS
+    # SHEET 1: RIASSUNTO (NUOVO FOGLIO)
+    summary_records = []
+    
+    # Extract date and time from timestamp correctly (handles _INTERROTTO if present)
+    parts = timestamp.split('_')
+    date_str = parts[0]
+    time_str = parts[1].replace('-', ':') if len(parts) > 1 else ""
+    
+    for row in data:
+        record = {
+            "Data": date_str,
+            "Ora": time_str,
+            "ID scenario": row["Scenario"]
+        }
+        for key in DEFAULT_CONFIG.keys():
+            if key == "reward_alpha":
+                record[key] = alpha_reward
+            else:
+                record[key] = DEFAULT_CONFIG[key]
+                
+        record["Step DEC-POMCP"] = row["Step POMCP"]
+        record["Step SHR-POMCP"] = row["Step SHR-POMCP"]
+        record["Step CEN-POMCP"] = row["Step CEN-POMCP"]
+        record["Step AUCTION"] = row["Step AUCTION"]
+        record["Step GREEDY"] = row["Step GREEDY"]
+        
+        summary_records.append(record)
+        
+    df_summary = pd.DataFrame(summary_records)
+    df_summary.to_excel(writer, sheet_name='Riassunto', index=False)
+    worksheet_summary = writer.sheets['Riassunto']
+    for i, col in enumerate(df_summary.columns):
+        column_len = max(df_summary[col].astype(str).map(len).max(), len(col)) + 2
+        worksheet_summary.set_column(i, i, column_len)
+
+    # SHEET 2: SCENARIO PARAMETERS
     df_params = pd.DataFrame(data)[["Scenario", "Drone Pos", "Target Pos", "Num Peaks", "Peak Means", "Peak Vars", "Obstacles"]]
     df_params["Num Steps Map"] = DEFAULT_CONFIG['map_size'] 
     df_params.to_excel(writer, sheet_name='Parametri', index=False)
@@ -187,7 +222,7 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
         column_len = max(df_params[col].astype(str).map(len).max(), len(col)) + 2
         worksheet_param.set_column(i, i, column_len)
 
-    # SHEET 2: ALGORITHM PERFORMANCE COMPARISON
+    # SHEET 3: ALGORITHM PERFORMANCE COMPARISON
     performance_records = []
     win_counts = {"DEC-POMCP": 0, "SHR-POMCP": 0, "CEN-POMCP": 0, "AUCTION": 0, "GREEDY": 0}
     
@@ -321,7 +356,7 @@ def generate_excel_report(data, session_folder, timestamp, alpha_reward):
         data_row += 3 # Move down for the next chart's data
 
     # =========================================================================
-    # SHEET 3: POMCP METRICS FOR ALL VERSIONS
+    # SHEET 4: POMCP METRICS FOR ALL VERSIONS
     # =========================================================================
     metrics_records = []
     for row in data:
